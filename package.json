@@ -5,10 +5,13 @@
   "description": "Anthropic Messages → Qoder 中国站 legacy 代理（Gate 1 Walking Skeleton）",
   "license": "UNLICENSED",
   "bin": {
-    "qoder-proxy": "dist/qoder-proxy.js"
+    "qoder-proxy": "dist/qoder-proxy.js",
+    "qoder-statusline-install": "dist/install-qoder-statusline.js"
   },
   "files": [
     "dist/qoder-proxy.js",
+    "dist/qoder-statusline-runtime.js",
+    "dist/install-qoder-statusline.js",
     "README.md"
   ],
   "publishConfig": {
@@ -19,7 +22,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "build": "bun build src/cli.ts --target bun --outfile dist/qoder-proxy.js --minify --banner '#!/usr/bin/env bun' && chmod 755 dist/qoder-proxy.js",
+    "build": "bun build src/cli.ts --target bun --outfile dist/qoder-proxy.js --minify --banner '#!/usr/bin/env bun' && bun build src/statusline-runtime.ts --target bun --outfile dist/qoder-statusline-runtime.js --minify && bun build src/statusline-installer.ts --target bun --outfile dist/install-qoder-statusline.js --minify --banner '#!/usr/bin/env bun' && chmod 755 dist/qoder-proxy.js dist/qoder-statusline-runtime.js dist/install-qoder-statusline.js",
     "dev": "bun --watch src/cli.ts",
     "start": "bun src/cli.ts",
     "start:dist": "bun dist/qoder-proxy.js",

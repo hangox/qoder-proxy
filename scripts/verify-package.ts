@@ -18,7 +18,7 @@ const packs = JSON.parse(result.stdout) as Array<{
   files?: Array<{ path?: string }>;
 }>;
 const paths = packs[0]?.files?.map((file) => file.path).filter((path): path is string => typeof path === "string") ?? [];
-const required = new Set(["README.md", "dist/qoder-proxy.js", "package.json"]);
+const required = new Set(["README.md", "dist/qoder-proxy.js", "dist/qoder-statusline-runtime.js", "dist/install-qoder-statusline.js", "package.json"]);
 const forbidden = [
   /^\.claude(?:\/|$)/,
   /^CLAUDE\.md$/,
