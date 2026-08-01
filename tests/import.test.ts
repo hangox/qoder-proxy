@@ -157,9 +157,12 @@ describe("crash-safe import transaction", () => {
     expect(result.replaced).toBe(false);
     expect((await lstat(configDir)).mode & 0o777).toBe(0o700);
     expect((await lstat(join(configDir, "auth-cn.json"))).mode & 0o777).toBe(0o600);
+    expect((await lstat(join(configDir, "machine_id"))).mode & 0o777).toBe(0o600);
+    expect(await readMachineIdFile(join(configDir, "machine_id"))).toBe("0123456789abcdef-machine");
     expect((await store.load())?.token).toBe("imported-access");
     await store.rollbackImport!(result.backupId);
     await expect(lstat(join(configDir, "auth-cn.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(join(configDir, "machine_id"))).rejects.toMatchObject({ code: "ENOENT" });
     expect((await readdir(configDir)).filter((name) => name.includes("import"))).toEqual([]);
   });
 
