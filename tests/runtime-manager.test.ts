@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
-import { QoderRuntimeManager } from "../src/runtime-manager.ts";
+import { QoderRuntimeManager, runRuntimeCommand } from "../src/runtime-manager.ts";
 
 const managers: QoderRuntimeManager[] = [];
 const tempDirs: string[] = [];
@@ -115,6 +115,25 @@ describe("Qoder runtime manager lease lifecycle", () => {
     }
     expect(stopped).toBe(true);
     for (const child of ownerChildren) child.kill("SIGTERM");
+  });
+
+  it("publishes status JSON before and after release without the secret", async () => {
+    const fake = await createFakeProxy();
+    const machineId = join(fake.directory, "machine_id");
+    await writeFile(machineId, "machine-test\n", { mode: 0o600 });
+    const socket = join(fake.directory, "runtime.sock");
+    const manager = new QoderRuntimeManager(envFor(fake, socket, machineId));
+    managers.push(manager);
+    await manager.listen();
+    const lease = await manager.acquire("run-status", process.pid);
+    const outputs: string[] = [];
+    const io = { stdout: (value: string) => outputs.push(value), stderr: () => {} };
+    await runRuntimeCommand(["status", "run-status", String(process.pid), lease.leaseId], envFor(fake, socket, machineId), io);
+    expect(JSON.parse(outputs.pop()!)).toMatchObject({ active: true, runId: "run-status", ownerPid: process.pid, leaseId: lease.leaseId, baseUrl: lease.baseUrl, socketPath: socket });
+    expect(outputs.join("\n")).not.toContain(lease.token);
+    manager.release("run-status", process.pid, lease.leaseId);
+    await runRuntimeCommand(["status", "run-status", String(process.pid), lease.leaseId], envFor(fake, socket, machineId), io);
+    expect(JSON.parse(outputs.pop()!)).toMatchObject({ active: false, runId: "run-status", ownerPid: process.pid, leaseId: lease.leaseId, socketPath: socket });
   });
 
   it("uses distinct credentials per run and rejects cross-run keys", async () => {
