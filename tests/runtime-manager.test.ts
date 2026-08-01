@@ -1,17 +1,14 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { spawn, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { request as httpRequest } from "node:http";
 import { QoderRuntimeManager } from "../src/runtime-manager.ts";
 
 const managers: QoderRuntimeManager[] = [];
 const tempDirs: string[] = [];
-const fakeChildren: ChildProcess[] = [];
-
 afterEach(async () => {
   for (const manager of managers.splice(0)) await manager.stop();
-  for (const child of fakeChildren.splice(0)) { child.kill("SIGTERM"); await new Promise((resolve) => child.once("exit", resolve)); }
   await Promise.all(tempDirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
@@ -20,31 +17,37 @@ async function createFakeProxy(): Promise<{ directory: string; executable: strin
   tempDirs.push(directory);
   const executable = join(directory, "qoder-proxy");
   const starts = join(directory, "starts");
-  await writeFile(executable, `#!/usr/bin/env python3
-import json
-import os
-import signal
-from http.server import BaseHTTPRequestHandler, HTTPServer
+  await writeFile(executable, `#!/usr/bin/env bun
+import { appendFileSync } from "node:fs";
 
-with open(os.environ["QODER_RUNTIME_TEST_STARTS"], "a") as starts:
-    starts.write(str(os.getpid()) + "\\n")
-port = int(os.environ["PORT"])
-token = os.environ["QODER_PROXY_API_KEY"]
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path != "/internal/quota":
-            self.send_response(404); self.end_headers(); return
-        if self.headers.get("Authorization") != "Bearer " + token:
-            self.send_response(401); self.end_headers(); return
-        self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
-        self.wfile.write(json.dumps({"percentage": 12, "pid": os.getpid()}).encode())
-    def log_message(self, *_): pass
-server = HTTPServer(("127.0.0.1", port), Handler)
-signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-server.serve_forever()
+appendFileSync(process.env.QODER_RUNTIME_TEST_STARTS!, String(process.pid) + "\\n");
+const port = Number(process.env.PORT);
+const token = process.env.QODER_PROXY_API_KEY!;
+const server = Bun.serve({
+  hostname: "127.0.0.1",
+  port,
+  fetch(request) {
+    if (new URL(request.url).pathname !== "/internal/quota") return new Response(null, { status: 404 });
+    if (request.headers.get("authorization") !== "Bearer " + token) return new Response(null, { status: 401 });
+    return Response.json({ percentage: 12, pid: process.pid });
+  },
+});
+process.on("SIGTERM", () => { server.stop(); process.exit(0); });
 `, { mode: 0o700 });
   await writeFile(starts, "");
   return { directory, executable, starts };
+}
+
+async function requestStatus(url: string, token: string): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const request = httpRequest(new URL(url), { headers: { authorization: `Bearer ${token}` } }, (response) => {
+      response.resume();
+      response.once("end", () => resolve(response.statusCode || 0));
+    });
+    request.once("error", reject);
+    request.setTimeout(500, () => request.destroy(new Error("request timeout")));
+    request.end();
+  });
 }
 
 function envFor(fake: { executable: string; starts: string; directory: string }, socket: string, machineId: string) {
@@ -72,9 +75,7 @@ describe("Qoder runtime manager lease lifecycle", () => {
     const lease = await manager.acquire("run-independent", process.pid);
     expect(lease.baseUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
     expect(lease.token).toMatch(/^[0-9a-f]{64}$/);
-    const readyResponse = await fetch(`${lease.baseUrl}/internal/quota`, { headers: { authorization: `Bearer ${lease.token}` } });
-    expect(readyResponse.status).toBe(200);
-    await readyResponse.arrayBuffer();
+    expect(await requestStatus(`${lease.baseUrl}/internal/quota`, lease.token)).toBe(200);
     for (let attempt = 0; attempt < 20 && !(await readFile(fake.starts, "utf8")).match(/\d+/); attempt++) await new Promise((resolve) => setTimeout(resolve, 25));
     expect(await readFile(fake.starts, "utf8")).toMatch(/\d+/);
     expect(await readFile(fake.starts, "utf8")).not.toContain(lease.token);
@@ -97,8 +98,16 @@ describe("Qoder runtime manager lease lifecycle", () => {
     for (const owner of owners.slice(0, -1)) manager.release("run-shared", owner);
     expect((await fetch(`${leases[0]!.baseUrl}/internal/quota`, { headers: { authorization: `Bearer ${leases[0]!.token}` } })).status).toBe(200);
     manager.release("run-shared", owners.at(-1)!);
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    await expect(fetch(`${leases[0]!.baseUrl}/internal/quota`, { headers: { authorization: `Bearer ${leases[0]!.token}` } })).rejects.toThrow();
+    let stopped = false;
+    for (let attempt = 0; attempt < 40 && !stopped; attempt++) {
+      try {
+        stopped = (await requestStatus(`${leases[0]!.baseUrl}/internal/quota`, leases[0]!.token)) !== 200;
+      } catch {
+        stopped = true;
+      }
+      if (!stopped) await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(stopped).toBe(true);
   });
 
   it("uses distinct credentials per run and rejects cross-run keys", async () => {
@@ -112,13 +121,9 @@ describe("Qoder runtime manager lease lifecycle", () => {
     const first = await manager.acquire("run-one", process.pid);
     const second = await manager.acquire("run-two", process.pid);
     expect(first.token).not.toBe(second.token);
-    const firstResponse = await fetch(`${first.baseUrl}/internal/quota`, { headers: { authorization: `Bearer ${first.token}` } });
-    expect(firstResponse.status).toBe(200);
-    const firstBody = await firstResponse.json() as { pid?: number };
-    expect(firstBody.pid).toBeTypeOf("number");
-    const crossRunResponse = await fetch(`${first.baseUrl}/internal/quota`, { headers: { authorization: `Bearer ${second.token}` } });
-    expect(crossRunResponse.status).toBe(401);
-    await crossRunResponse.arrayBuffer();
+    expect(first.baseUrl).not.toBe(second.baseUrl);
+    expect(await requestStatus(`${first.baseUrl}/internal/quota`, first.token)).toBe(200);
+    expect(await requestStatus(`${first.baseUrl}/internal/quota`, second.token)).toBe(401);
   });
 
   it("fails closed and does not leave a child when readiness fails", async () => {

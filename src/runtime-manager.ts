@@ -4,6 +4,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
+import { request as httpRequest } from "node:http";
 
 export type RuntimeEnv = Record<string, string | undefined>;
 export type RuntimeIo = { stdout(value: string): void; stderr(value: string): void };
@@ -15,6 +16,11 @@ const socketPath = (env: RuntimeEnv = process.env): string => env.QODER_PROXY_RU
 const READY_TIMEOUT_MS = 20_000;
 const CLIENT_TIMEOUT_MS = 2_000;
 const IDLE_TIMEOUT_MS = 3_000;
+const DEFAULT_REAPER_MS = 500;
+function reaperIntervalMs(env: RuntimeEnv): number {
+  const parsed = Number(env.QODER_RUNTIME_REAPER_MS);
+  return Number.isInteger(parsed) && parsed >= 50 && parsed <= 60_000 ? parsed : DEFAULT_REAPER_MS;
+}
 
 function validRunId(value: unknown): value is string { return typeof value === "string" && /^[A-Za-z0-9._:-]{1,160}$/.test(value); }
 function validOwnerPid(value: unknown): value is number { return typeof value === "number" && Number.isInteger(value) && value > 1; }
@@ -34,7 +40,8 @@ function resolveProxyCommand(env: RuntimeEnv): { command: string; args: string[]
   return { command: bun, args: [join(proxyDir, "src/cli.ts"), "serve"], cwd: proxyDir };
 }
 function machineIdFile(env: RuntimeEnv): string {
-  const value = env.QODER_CN_MACHINE_ID_FILE || join(env.HOME || "", ".qoder-cn/.auth/machine_id");
+  const value = env.QODER_CN_MACHINE_ID_FILE;
+  if (!value) throw new Error("必须显式提供 QODER_CN_MACHINE_ID_FILE");
   if (!existsSync(value)) throw new Error("Qoder machine ID 文件不可用或不安全");
   const st = lstatSync(value); if (!st.isFile() || st.isSymbolicLink()) throw new Error("Qoder machine ID 文件不可用或不安全");
   return value;
@@ -45,15 +52,34 @@ async function reservePort(): Promise<number> {
     server.listen(0, "127.0.0.1", () => { const address = server.address(); const port = typeof address === "object" && address ? address.port : 0; server.close(() => port > 0 ? resolve(port) : reject(new Error("无法分配本地端口"))); });
   });
 }
+async function requestStatus(url: string, token: string): Promise<{ status: number; body: string }> {
+  return await new Promise((resolve, reject) => {
+    const request = httpRequest(new URL(url), { headers: { authorization: `Bearer ${token}` } }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.once("end", () => resolve({ status: response.statusCode || 0, body: Buffer.concat(chunks).toString("utf8") }));
+    });
+    request.once("error", reject);
+    request.setTimeout(500, () => request.destroy(new Error("request timeout")));
+    request.end();
+  });
+}
 async function waitReady(baseUrl: string, token: string): Promise<void> {
   const deadline = Date.now() + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    try { const response = await fetch(`${baseUrl}/internal/quota`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(500) }); if (response.status === 200) return; } catch { /* readiness retry */ }
+    try { if ((await requestStatus(`${baseUrl}/internal/quota`, token)).status === 200) return; } catch { /* readiness retry */ }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error("qoder-proxy readiness 超时");
 }
 function killChild(child: ChildProcess): void { if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM"); }
+async function waitChildExit(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, 1_000);
+    child.once("exit", () => { clearTimeout(timer); resolve(); });
+  });
+}
 function alive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch { return false; } }
 
 export class QoderRuntimeManager {
@@ -84,11 +110,20 @@ export class QoderRuntimeManager {
     const path = socketPath(this.env); try { if (existsSync(path)) unlinkSync(path); } catch { /* stale socket is fail-closed */ }
     this.server = createServer((socket) => this.handle(socket));
     await new Promise<void>((resolve, reject) => { this.server!.once("error", reject); this.server!.listen(path, () => { try { chmodSync(path, 0o600); } catch {} resolve(); }); });
-    this.reaper = setInterval(() => this.reapDeadOwners(), 500); this.reaper.unref();
+    this.reaper = setInterval(() => this.reapDeadOwners(), reaperIntervalMs(this.env)); this.reaper.unref();
   }
   private handle(socket: Socket): void { let data = ""; socket.setEncoding("utf8"); socket.on("data", (chunk) => { data += chunk; const newline = data.indexOf("\n"); if (newline < 0) return; let request: RuntimeRequest; try { request = JSON.parse(data.slice(0, newline)) as RuntimeRequest; } catch { socket.end('{"ok":false,"error":"invalid runtime request"}\n'); return; } void this.dispatch(socket, request); }); }
   private async dispatch(socket: Socket, request: RuntimeRequest): Promise<void> { try { if (request.op === "acquire") { const result = await this.acquire(request.runId || "", request.ownerPid || 0); socket.end(JSON.stringify({ ok: true, ...result }) + "\n"); return; } if (request.op === "release") { this.release(request.runId || "", request.ownerPid || 0); socket.end('{"ok":true}\n'); return; } if (request.op === "shutdown") { await this.stop(); socket.end('{"ok":true}\n'); return; } throw new Error("未知 runtime 操作"); } catch (error) { socket.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : "runtime failed" }) + "\n"); } }
-  async stop(): Promise<void> { if (this.idleTimer) clearTimeout(this.idleTimer); if (this.reaper) clearInterval(this.reaper); for (const lease of this.leases.values()) killChild(lease.child); this.leases.clear(); await new Promise<void>((resolve) => this.server?.close(() => resolve()) ?? resolve()); const path = socketPath(this.env); try { if (existsSync(path)) unlinkSync(path); } catch {} }
+  async stop(): Promise<void> {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    if (this.reaper) clearInterval(this.reaper);
+    const children = [...this.leases.values()].map((lease) => lease.child);
+    for (const child of children) killChild(child);
+    await Promise.all(children.map(waitChildExit));
+    this.leases.clear();
+    await new Promise<void>((resolve) => this.server?.close(() => resolve()) ?? resolve());
+    const path = socketPath(this.env); try { if (existsSync(path)) unlinkSync(path); } catch {}
+  }
 }
 
 function socketClient(request: RuntimeRequest, env: RuntimeEnv): Promise<RuntimeResponse> { return new Promise((resolve, reject) => { const socket = createConnection(socketPath(env)); let data = ""; const timer = setTimeout(() => { socket.destroy(); reject(new Error("runtime daemon unavailable")); }, CLIENT_TIMEOUT_MS); socket.setEncoding("utf8"); socket.on("error", (error) => { clearTimeout(timer); reject(error); }); socket.on("data", (chunk) => { data += chunk; const newline = data.indexOf("\n"); if (newline < 0) return; clearTimeout(timer); socket.end(); try { resolve(JSON.parse(data.slice(0, newline)) as RuntimeResponse); } catch (error) { reject(error); } }); socket.write(JSON.stringify(request) + "\n"); }); }
