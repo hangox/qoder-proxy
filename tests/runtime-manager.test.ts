@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
 import { QoderRuntimeManager, runRuntimeCommand } from "../src/runtime-manager.ts";
+import { resolveMachineIdSource } from "../src/machine-id.ts";
 
 const managers: QoderRuntimeManager[] = [];
 const tempDirs: string[] = [];
@@ -66,6 +67,13 @@ function envFor(fake: { executable: string; starts: string; routes: string; dire
     TMPDIR: fake.directory,
   };
 }
+
+describe("Qoder runtime machine source", () => {
+  it("accepts direct-only machine ID and rejects direct plus file ambiguity", () => {
+    expect(resolveMachineIdSource({ QODER_CN_MACHINE_ID: "direct-machine" })).toEqual({ direct: "direct-machine" });
+    expect(() => resolveMachineIdSource({ QODER_CN_MACHINE_ID: "direct-machine", QODER_CN_MACHINE_ID_FILE: "/tmp/machine_id" })).toThrow(/不能同时/);
+  });
+});
 
 describe("Qoder runtime manager lease lifecycle", () => {
   it("uses the proxy-owned machine ID after an imported session clears the file override", async () => {

@@ -325,6 +325,56 @@ describe("crash-safe import transaction", () => {
     }
   });
 
+  it("recovers a pending apply with target config and missing machine ID", async () => {
+    const root = await temporaryRoot();
+    const configDir = join(root, "pending-target-missing-machine");
+    const base = createConfigStore("0123456789abcdef-machine", { QODER_PROXY_CONFIG_DIR: configDir });
+    const crashing = createConfigStore("0123456789abcdef-machine", { QODER_PROXY_CONFIG_DIR: configDir }, { onImportPhase: (phase) => { if (phase === "after-replace") throw new Error("crash-after-replace"); } });
+    await expect(crashing.applyImport!(importedCredential(), false)).rejects.toThrow("crash-after-replace");
+    await rm(join(configDir, "machine_id"));
+    await expect(base.importStatus!()).resolves.toEqual([{ backupId: expect.any(String), state: "committed" }]);
+    await expect(readFile(join(configDir, "machine_id"), "utf8")).resolves.toBe("0123456789abcdef-machine\n");
+  });
+
+  it("recovers pending previous config with target machine and restores previous machine", async () => {
+    const root = await temporaryRoot();
+    const configDir = join(root, "pending-previous-target-machine");
+    const base = createConfigStore("0123456789abcdef-machine", { QODER_PROXY_CONFIG_DIR: configDir });
+    await base.save(importedCredential("0123456789abcdef-machine", "old-access"));
+    await writeFile(join(configDir, "machine_id"), "previous-machine\n", { mode: 0o600 });
+    const crashing = createConfigStore("0123456789abcdef-machine", { QODER_PROXY_CONFIG_DIR: configDir }, { onImportPhase: (phase) => { if (phase === "after-machine-replace") throw new Error("crash-after-machine"); } });
+    await expect(crashing.applyImport!(importedCredential(), true)).rejects.toThrow("crash-after-machine");
+    await expect(base.importStatus!()).resolves.toEqual([]);
+    await expect(base.load()).resolves.toMatchObject({ token: "old-access" });
+    await expect(readFile(join(configDir, "machine_id"), "utf8")).resolves.toBe("previous-machine\n");
+  });
+
+  it("keeps pending evidence when machine ID is tampered", async () => {
+    const root = await temporaryRoot();
+    const configDir = join(root, "pending-machine-tamper");
+    const base = createConfigStore("0123456789abcdef-machine", { QODER_PROXY_CONFIG_DIR: configDir });
+    await base.save(importedCredential("0123456789abcdef-machine", "old-access"));
+    const crashing = createConfigStore("0123456789abcdef-machine", { QODER_PROXY_CONFIG_DIR: configDir }, { onImportPhase: (phase) => { if (phase === "after-pending") throw new Error("crash-after-pending"); } });
+    await expect(crashing.applyImport!(importedCredential(), true)).rejects.toThrow("crash-after-pending");
+    await writeFile(join(configDir, "machine_id"), "third-party-machine\n", { mode: 0o600 });
+    await expect(base.importStatus!()).rejects.toThrow(/machine|第三方/);
+    await expect(lstat(join(configDir, "auth-cn.import.pending"))).resolves.toBeDefined();
+  });
+
+  it("keeps finalize and rollback evidence when machine ID is replaced by a hook", async () => {
+    const root = await temporaryRoot();
+    for (const operation of ["finalize", "rollback"] as const) {
+      const configDir = join(root, `machine-hook-${operation}`);
+      const base = createConfigStore("0123456789abcdef-machine", { QODER_PROXY_CONFIG_DIR: configDir });
+      await base.save(importedCredential("0123456789abcdef-machine", "old-access"));
+      const applied = await base.applyImport!(importedCredential(), true);
+      const racing = createConfigStore("0123456789abcdef-machine", { QODER_PROXY_CONFIG_DIR: configDir }, { beforeImportTargetRecheck: async (observed) => { if (observed === operation) await writeFile(join(configDir, "machine_id"), "third-party-machine\n", { mode: 0o600 }); } });
+      const action = operation === "finalize" ? racing.finalizeImport!(applied.backupId) : racing.rollbackImport!(applied.backupId);
+      await expect(action).rejects.toThrow(/machine|替换|内容/);
+      await expect(lstat(join(configDir, "auth-cn.import.pending"))).resolves.toBeDefined();
+    }
+  });
+
   it("fails closed without modifying evidence when a pending import sees a third-party target", async () => {
     const root = await temporaryRoot();
     const configDir = join(root, "config");

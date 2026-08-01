@@ -204,7 +204,7 @@ type ConfigStoreDependencies = {
   capabilityExecutable?: string;
   spawnCapabilityProcess?: typeof spawn;
   publishFdExclusive?: (sourceFd: number, target: string) => void | Promise<void>;
-  onImportPhase?: (phase: "after-receipt" | "after-backup" | "after-pending" | "after-replace" | "after-pending-cleanup" | "after-rollback-pending" | "after-rollback-replace" | "after-finalize-pending") => void | Promise<void>;
+  onImportPhase?: (phase: "after-receipt" | "after-backup" | "after-pending" | "after-machine-replace" | "after-replace" | "after-pending-cleanup" | "after-rollback-pending" | "after-rollback-replace" | "after-finalize-pending") => void | Promise<void>;
   afterImportNoReplaceLink?: (paths: { temp: string; target: string }) => void | Promise<void>;
   beforeImportTargetRecheck?: (operation: "rollback" | "finalize") => void | Promise<void>;
 };
@@ -2353,6 +2353,7 @@ export function createConfigStore(machineId: string, env: Record<string, string 
             // 先发布 machine；若 auth 发布失败，立即按 receipt 恢复 machine，避免 auth 新而 machine 旧。
             await writeAtomicBytes(machineIdPath, targetMachine);
             machinePublished = true;
+            await dependencies.onImportPhase?.("after-machine-replace");
             await writeAtomicBytes(configPath, canonical);
           } catch (error) {
             if (machinePublished) {
