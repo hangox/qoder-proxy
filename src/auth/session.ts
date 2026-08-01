@@ -1992,7 +1992,6 @@ export function createConfigStore(machineId: string, env: Record<string, string 
           const machineHash = await readMachineHash();
           const previousMachineMatches = pending.machinePreviousPresent ? machineHash === pending.machinePreviousHash : machineHash === undefined;
           if (!previousMachineMatches) throw new Error("import rollback 恢复时 machine ID 已被第三方修改");
-          await restoreMachinePrevious(pending, undefined);
         }
       }
       await cleanupImportBundle(pending.backupId, pending);
