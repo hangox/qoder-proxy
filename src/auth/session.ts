@@ -1984,7 +1984,8 @@ export function createConfigStore(machineId: string, env: Record<string, string 
             if (!sameImportRecord(rollbackBundle.record, pending)) throw new Error("import rollback pending 与 receipt 不匹配");
             if (pending.previousPresent) await writeAtomicBytes(configPath, rollbackBundle.previous!);
             else { await unlink(configPath); await syncConfigDir(); }
-          } finally { rollbackBundle.previous?.fill(0); }
+            await restoreMachinePrevious(rollbackBundle.record, rollbackBundle.previousMachine);
+          } finally { rollbackBundle.previous?.fill(0); rollbackBundle.previousMachine?.fill(0); }
         }
       }
       await cleanupImportBundle(pending.backupId, pending);

@@ -73,7 +73,7 @@ describe("Qoder runtime manager lease lifecycle", () => {
     const configDir = join(fake.directory, "config");
     await mkdir(configDir, { mode: 0o700 });
     await writeFile(join(configDir, "machine_id"), "machine-test\n", { mode: 0o600 });
-    const env = { ...envFor(fake, join(fake.directory, "runtime.sock"), join(configDir, "machine_id")), QODER_PROXY_CONFIG_DIR: configDir };
+    const env: Record<string, string | undefined> = { ...envFor(fake, join(fake.directory, "runtime.sock"), join(configDir, "machine_id")), QODER_PROXY_CONFIG_DIR: configDir };
     delete env.QODER_CN_MACHINE_ID_FILE;
     const manager = new QoderRuntimeManager(env);
     managers.push(manager);
