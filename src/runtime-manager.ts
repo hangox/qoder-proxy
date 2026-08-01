@@ -128,6 +128,17 @@ export class QoderRuntimeManager {
   private stopped = false;
   constructor(env: RuntimeEnv = process.env) { this.env = env; }
   isStopped(): boolean { return this.stopped; }
+  private releaseOwnLock(): void {
+    if (this.lockFd !== undefined) {
+      closeSync(this.lockFd);
+      this.lockFd = undefined;
+    }
+    try {
+      const record = lockRecord(lockPath(this.env));
+      if (record?.pid === process.pid && record.nonce === this.lockNonce) unlinkSync(lockPath(this.env));
+    } catch {}
+    this.lockNonce = undefined;
+  }
   async acquire(runId: string, ownerPid: number, tier: QoderTier = "sonnet"): Promise<{ runId: string; leaseId: string; baseUrl: string; socketPath: string; token: string; tier: QoderTier; routingKey: string }> {
     if (!validRunId(runId) || !validOwnerPid(ownerPid) || !alive(ownerPid)) throw new Error("非法 runtime run/owner");
     const normalizedTier = tierValue(tier);
@@ -190,8 +201,9 @@ export class QoderRuntimeManager {
       try {
         const mode = statSync(path).mode & 0o777;
         if (mode !== 0o600) throw new Error("runtime socket 权限不安全");
-      } catch { if (this.lockFd !== undefined) closeSync(this.lockFd); this.lockFd = undefined; throw new Error("runtime socket 不可用"); }
-      if (this.lockFd !== undefined) closeSync(this.lockFd); this.lockFd = undefined; throw new Error("runtime socket 已存在");
+      } catch { this.releaseOwnLock(); throw new Error("runtime socket 不可用"); }
+      this.releaseOwnLock();
+      throw new Error("runtime socket 已存在");
     }
     this.server = createServer((socket) => this.handle(socket));
     try {
@@ -244,15 +256,7 @@ export class QoderRuntimeManager {
     try {
       if (existsSync(path) && this.socketInode !== undefined && BigInt(statSync(path).ino) === this.socketInode) unlinkSync(path);
     } catch {}
-    if (this.lockFd !== undefined) {
-      closeSync(this.lockFd);
-      this.lockFd = undefined;
-      try {
-        const record = lockRecord(lockPath(this.env));
-        if (record?.pid === process.pid && record.nonce === this.lockNonce) unlinkSync(lockPath(this.env));
-      } catch {}
-      this.lockNonce = undefined;
-    }
+    this.releaseOwnLock();
     this.socketInode = undefined;
     this.server = undefined;
     this.stopped = true;
