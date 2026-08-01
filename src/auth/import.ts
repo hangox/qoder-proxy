@@ -5,6 +5,7 @@ import { open, lstat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { decryptCredentialStorage, loadAuthBridge, sha256, type Bridge } from "./bridge.ts";
+import { readMachineIdFile } from "../machine-id.ts";
 import { createConfigStore, type CredentialStore, type StoredCredential } from "./session.ts";
 
 const MACHINE_ID_MAX_BYTES = 4 * 1024;
@@ -77,12 +78,7 @@ function parseMachineId(bytes: Buffer): string {
   return value;
 }
 
-export async function readMachineIdFile(path: string): Promise<string> {
-  if (!isAbsolute(path)) throw new Error("QODER_CN_MACHINE_ID_FILE 必须是绝对路径");
-  const bytes = await readSecureFile(path, "machine ID 文件", MACHINE_ID_MAX_BYTES);
-  try { return parseMachineId(bytes); }
-  finally { bytes.fill(0); }
-}
+export { readMachineIdFile } from "../machine-id.ts";
 
 function requireOptionalString(value: unknown, field: string): string | undefined {
   if (value === undefined || value === null || value === "") return undefined;

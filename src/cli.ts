@@ -4,7 +4,8 @@ import { serve } from "@hono/node-server";
 import type { ServerType } from "@hono/node-server";
 import { createApp } from "./proxy.ts";
 import { AuthSession, PendingPreflightPersistenceError, type CredentialStore } from "./auth/session.ts";
-import { DEFAULT_QODER_SOURCE_DIR, importStore, prepareQoderImport, readMachineIdFile, type ImportDependencies, type PreparedQoderImport } from "./auth/import.ts";
+import { DEFAULT_QODER_SOURCE_DIR, importStore, prepareQoderImport, type ImportDependencies, type PreparedQoderImport } from "./auth/import.ts";
+import { readMachineIdFile, resolveMachineIdPath } from "./machine-id.ts";
 import { logger } from "./logger.ts";
 import { createRoutingAttestation } from "./attestation.ts";
 import type { RoutingAttestation } from "./attestation.ts";
@@ -125,7 +126,7 @@ export async function resolveServeEnvironment(env: Record<string, string | undef
   const fileDefined = env.QODER_CN_MACHINE_ID_FILE !== undefined;
   if (directDefined && fileDefined) throw new Error("QODER_CN_MACHINE_ID 与 QODER_CN_MACHINE_ID_FILE 不能同时设置");
   if (!fileDefined) return { ...env };
-  const machineId = await readMachineIdFile(env.QODER_CN_MACHINE_ID_FILE!);
+  const machineId = await readMachineIdFile(resolveMachineIdPath(env));
   const resolved: Record<string, string | undefined> = { ...env, QODER_CN_MACHINE_ID: machineId };
   delete resolved.QODER_CN_MACHINE_ID_FILE;
   return resolved;

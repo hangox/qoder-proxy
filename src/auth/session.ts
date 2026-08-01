@@ -811,6 +811,7 @@ export function createConfigStore(machineId: string, env: Record<string, string 
   const machineIdHash = sha256(machineId);
   const configDir = resolveConfigDir(env);
   const configPath = join(configDir, CONFIG_FILE);
+  const machineIdPath = join(configDir, "machine_id");
   const rotationPath = join(configDir, ROTATION_FILE);
   const emergencyRotationPath = join(configDir, EMERGENCY_ROTATION_FILE);
   const rotationReservationPath = join(configDir, ROTATION_RESERVATION_FILE);
@@ -830,7 +831,17 @@ export function createConfigStore(machineId: string, env: Record<string, string 
   };
   type ReservationRecord = { version: 1; owner: string; processId: number; processStartIdentity: string; baseCredentialHash: string; phase?: "capability" | "refresh-started" };
   type RotationRecord = { version: 1; owner: string; artifactId?: string; sourceArtifactId?: string; baseCredentialHash: string; targetCredentialHash: string; credential: StoredCredential };
-  type ImportRecord = { version: 1; backupId: string; previousPresent: boolean; previousHash?: string; targetHash: string; action?: "apply" | "rollback-cleanup" | "finalize-cleanup" };
+  type ImportRecord = {
+    version: 1;
+    backupId: string;
+    previousPresent: boolean;
+    previousHash?: string;
+    machinePreviousPresent: boolean;
+    machinePreviousHash?: string;
+    targetHash: string;
+    targetMachineHash?: string;
+    action?: "apply" | "rollback-cleanup" | "finalize-cleanup";
+  };
   const credentialHash = (credential: StoredCredential): string => sha256(JSON.stringify([
     credential.version,
     credential.site,
@@ -1612,7 +1623,8 @@ export function createConfigStore(machineId: string, env: Record<string, string 
   const importBackupDir = (backupId: string): string => join(configDir, `${IMPORT_BACKUP_PREFIX}${backupId}`);
   const importReceiptPath = (backupId: string): string => join(importBackupDir(backupId), "receipt.json");
   const importBackupPath = (backupId: string): string => join(importBackupDir(backupId), "previous.bin");
-  const importTempPattern = /^\.(receipt\.json|previous\.bin)\.(\d+)\.([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.tmp$/i;
+  const importMachineBackupPath = (backupId: string): string => join(importBackupDir(backupId), "machine.bin");
+  const importTempPattern = /^\.(receipt\.json|previous\.bin|machine\.bin)\.(\d+)\.([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.tmp$/i;
   const validateBackupId = (backupId: string): void => {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(backupId)) throw new Error("backup ID 非法");
   };
@@ -1620,8 +1632,13 @@ export function createConfigStore(machineId: string, env: Record<string, string 
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     if (parsed.version !== 1 || typeof parsed.backupId !== "string" || typeof parsed.previousPresent !== "boolean"
       || (parsed.previousPresent ? typeof parsed.previousHash !== "string" || parsed.previousHash.length !== 64 : parsed.previousHash !== undefined)
+      || (parsed.machinePreviousPresent !== undefined && typeof parsed.machinePreviousPresent !== "boolean")
+      || (parsed.machinePreviousPresent === true && (typeof parsed.machinePreviousHash !== "string" || parsed.machinePreviousHash.length !== 64))
+      || (parsed.machinePreviousPresent === false && parsed.machinePreviousHash !== undefined)
       || typeof parsed.targetHash !== "string" || parsed.targetHash.length !== 64
+      || (parsed.targetMachineHash !== undefined && (typeof parsed.targetMachineHash !== "string" || parsed.targetMachineHash.length !== 64))
       || (parsed.action !== undefined && parsed.action !== "apply" && parsed.action !== "rollback-cleanup" && parsed.action !== "finalize-cleanup")) throw new Error(`${label} 内容非法`);
+    if (parsed.machinePreviousPresent === undefined) parsed.machinePreviousPresent = false;
     validateBackupId(parsed.backupId);
     return parsed as ImportRecord;
   };
@@ -1705,21 +1722,55 @@ export function createConfigStore(machineId: string, env: Record<string, string 
     } finally { current?.fill(0); }
     await recheckImportFile(configPath, "config 凭据路径", expected);
   };
+  const recheckMachineTargetContent = async (expected: ImportFileSnapshot, expectedHash: string): Promise<void> => {
+    await recheckImportFile(machineIdPath, "machine ID 文件", expected);
+    const current = await readSecureBytes(machineIdPath, "machine ID 文件");
+    try {
+      if (!current || sha256(current) !== expectedHash) throw new Error("machine ID 文件内容在 import cleanup 前发生变化");
+    } finally { current?.fill(0); }
+    await recheckImportFile(machineIdPath, "machine ID 文件", expected);
+  };
+  const readMachineHash = async (): Promise<string | undefined> => {
+    const current = await readSecureBytes(machineIdPath, "machine ID 文件");
+    try { return current ? sha256(current) : undefined; } finally { current?.fill(0); }
+  };
+  const ensureMachineTarget = async (record: ImportRecord): Promise<void> => {
+    if (!record.targetMachineHash) return;
+    const currentHash = await readMachineHash();
+    if (currentHash === record.targetMachineHash) return;
+    if (currentHash !== undefined && currentHash !== record.machinePreviousHash) throw new Error("machine ID 文件内容在 import 恢复时发生变化");
+    await writeAtomicBytes(machineIdPath, Buffer.from(`${machineId}\n`, "utf8"));
+  };
+  const restoreMachinePrevious = async (record: ImportRecord, previousMachine?: Buffer): Promise<void> => {
+    if (!record.targetMachineHash) return;
+    const currentHash = await readMachineHash();
+    if (currentHash === record.machinePreviousHash) return;
+    if (currentHash !== record.targetMachineHash) throw new Error("machine ID 文件内容在 import rollback 前发生变化");
+    if (record.machinePreviousPresent) {
+      if (!previousMachine) throw new Error("import previous machine evidence 缺失");
+      await writeAtomicBytes(machineIdPath, previousMachine);
+    } else {
+      await removeIfExists(machineIdPath);
+      await syncConfigDir();
+    }
+  };
   const sameImportRecord = (left: ImportRecord, right: ImportRecord): boolean => left.backupId === right.backupId
-    && left.previousPresent === right.previousPresent && left.previousHash === right.previousHash && left.targetHash === right.targetHash;
-  type ImportTempSnapshot = { name: string; path: string; target: string; targetName: "receipt.json" | "previous.bin"; dev: number; ino: number; uid: number; mode: number; size: number; nlink: number; contentHash: string; action: "cleanup" | "promote" };
+    && left.previousPresent === right.previousPresent && left.previousHash === right.previousHash
+    && left.machinePreviousPresent === right.machinePreviousPresent && left.machinePreviousHash === right.machinePreviousHash
+    && left.targetHash === right.targetHash && left.targetMachineHash === right.targetMachineHash;
+  type ImportTempSnapshot = { name: string; path: string; target: string; targetName: "receipt.json" | "previous.bin" | "machine.bin"; dev: number; ino: number; uid: number; mode: number; size: number; nlink: number; contentHash: string; action: "cleanup" | "promote" };
   const normalizeImportNoReplaceTemps = async (backupId: string): Promise<void> => {
     validateBackupId(backupId);
     const dir = importBackupDir(backupId);
     const names = (await readdir(dir)).sort();
-    const allowedFinals = new Set(["receipt.json", "previous.bin"]);
+    const allowedFinals = new Set(["receipt.json", "previous.bin", "machine.bin"]);
     const tempNames = names.filter((name) => importTempPattern.test(name));
     const unknown = names.filter((name) => !allowedFinals.has(name) && !importTempPattern.test(name));
     if (unknown.length > 0) throw new Error(`import backup 含未知文件：${unknown.join(",")}`);
-    const grouped = new Map<"receipt.json" | "previous.bin", string[]>();
+    const grouped = new Map<"receipt.json" | "previous.bin" | "machine.bin", string[]>();
     for (const name of tempNames) {
       const match = importTempPattern.exec(name)!;
-      const targetName = match[1] as "receipt.json" | "previous.bin";
+      const targetName = match[1] as "receipt.json" | "previous.bin" | "machine.bin";
       grouped.set(targetName, [...(grouped.get(targetName) ?? []), name]);
     }
     for (const [targetName, candidates] of grouped) if (candidates.length > 1) throw new Error(`import ${targetName} 存在多个 orphan temp`);
@@ -1738,15 +1789,21 @@ export function createConfigStore(machineId: string, env: Record<string, string 
     const previousFinal = await readSecureBytes(importBackupPath(backupId), "import previous backup");
     const previousTempName = grouped.get("previous.bin")?.[0];
     const previousTemp = previousTempName ? await readSecureBytes(join(dir, previousTempName), "import previous temp") : undefined;
+    const machineFinal = await readSecureBytes(importMachineBackupPath(backupId), "import previous machine ID backup");
+    const machineTempName = grouped.get("machine.bin")?.[0];
+    const machineTemp = machineTempName ? await readSecureBytes(join(dir, machineTempName), "import previous machine ID temp") : undefined;
     try {
-      if (!authoritative && (previousFinal || previousTemp)) throw new Error("import previous evidence 缺少可信 receipt");
+      if (!authoritative && (previousFinal || previousTemp || machineFinal || machineTemp)) throw new Error("import previous evidence 缺少可信 receipt");
       if (authoritative?.previousPresent === false && (previousFinal || previousTemp)) throw new Error("import previous evidence 与 receipt 冲突");
+      if (authoritative?.machinePreviousPresent !== true && (machineFinal || machineTemp)) throw new Error("import previous machine evidence 与 receipt 冲突");
       for (const bytes of [previousFinal, previousTemp]) if (bytes && sha256(bytes) !== authoritative?.previousHash) throw new Error("import previous evidence hash 不匹配");
+      for (const bytes of [machineFinal, machineTemp]) if (bytes && sha256(bytes) !== authoritative?.machinePreviousHash) throw new Error("import previous machine evidence hash 不匹配");
       if (previousFinal && previousTemp && !previousFinal.equals(previousTemp)) throw new Error("import previous final/temp 内容冲突");
-    } finally { previousFinal?.fill(0); previousTemp?.fill(0); }
+      if (machineFinal && machineTemp && !machineFinal.equals(machineTemp)) throw new Error("import previous machine final/temp 内容冲突");
+    } finally { previousFinal?.fill(0); previousTemp?.fill(0); machineFinal?.fill(0); machineTemp?.fill(0); }
 
     const snapshots: ImportTempSnapshot[] = [];
-    for (const targetName of ["receipt.json", "previous.bin"] as const) {
+    for (const targetName of ["receipt.json", "previous.bin", "machine.bin"] as const) {
       const tempName = grouped.get(targetName)?.[0];
       if (!tempName) continue;
       const tempPath = join(dir, tempName), targetPath = join(dir, targetName);
@@ -1792,21 +1849,27 @@ export function createConfigStore(machineId: string, env: Record<string, string 
     }
     if (snapshots.length > 0) { await syncDirectory(dir); await syncConfigDir(); }
   };
-  const readValidatedImportBundle = async (backupId: string): Promise<{ record: ImportRecord; previous?: Buffer; receiptSnapshot: ImportFileSnapshot; previousSnapshot?: ImportFileSnapshot }> => {
+  const readValidatedImportBundle = async (backupId: string): Promise<{ record: ImportRecord; previous?: Buffer; previousMachine?: Buffer; receiptSnapshot: ImportFileSnapshot; previousSnapshot?: ImportFileSnapshot; previousMachineSnapshot?: ImportFileSnapshot }> => {
     validateBackupId(backupId);
     const record = await readImportRecord(importReceiptPath(backupId), "import receipt");
     if (!record || record.backupId !== backupId) throw new Error("import receipt 不存在或 backup ID 不匹配");
     const names = (await readdir(importBackupDir(backupId))).sort();
-    const expected = record.previousPresent ? ["previous.bin", "receipt.json"] : ["receipt.json"];
+    const expected = ["receipt.json", ...(record.previousPresent ? ["previous.bin"] : []), ...(record.machinePreviousPresent ? ["machine.bin"] : [])].sort();
     if (names.length !== expected.length || names.some((name, index) => name !== expected[index])) throw new Error("import backup 文件集合非法");
     const receiptSnapshot = await snapshotImportFile(importReceiptPath(backupId), "import receipt");
     const previous = record.previousPresent ? await readSecureBytes(importBackupPath(backupId), "import previous backup") : undefined;
     const previousSnapshot = record.previousPresent ? await snapshotImportFile(importBackupPath(backupId), "import previous backup") : undefined;
+    const previousMachine = record.machinePreviousPresent ? await readSecureBytes(importMachineBackupPath(backupId), "import previous machine ID backup") : undefined;
+    const previousMachineSnapshot = record.machinePreviousPresent ? await snapshotImportFile(importMachineBackupPath(backupId), "import previous machine ID backup") : undefined;
     if (record.previousPresent && (!previous || sha256(previous) !== record.previousHash)) {
       previous?.fill(0);
       throw new Error("import previous backup hash 不匹配");
     }
-    return { record, previous, receiptSnapshot, previousSnapshot };
+    if (record.machinePreviousPresent && (!previousMachine || sha256(previousMachine) !== record.machinePreviousHash)) {
+      previous?.fill(0); previousMachine?.fill(0);
+      throw new Error("import previous machine backup hash 不匹配");
+    }
+    return { record, previous, previousMachine, receiptSnapshot, previousSnapshot, previousMachineSnapshot };
   };
   const cleanupImportBundle = async (backupId: string, expected?: ImportRecord): Promise<void> => {
     validateBackupId(backupId);
@@ -1821,22 +1884,28 @@ export function createConfigStore(machineId: string, env: Record<string, string 
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
       throw error;
     }
-    if (names.some((name) => name !== "previous.bin" && name !== "receipt.json")) throw new Error("import backup cleanup 文件集合非法");
+    if (names.some((name) => name !== "previous.bin" && name !== "machine.bin" && name !== "receipt.json")) throw new Error("import backup cleanup 文件集合非法");
     const receipt = await readImportRecord(importReceiptPath(backupId), "import receipt");
     if (receipt && expected && !sameImportRecord(receipt, expected)) throw new Error("import backup cleanup receipt 不匹配");
     if (!receipt && !expected) throw new Error("import backup cleanup 缺少 receipt");
     const authoritative = expected ?? receipt!;
     if (!receipt && names.includes("previous.bin")) throw new Error("import backup cleanup 缺少 receipt 但仍有 previous evidence");
     const previous = await readSecureBytes(importBackupPath(backupId), "import previous backup");
+    const previousMachine = await readSecureBytes(importMachineBackupPath(backupId), "import previous machine ID backup");
     try {
       if (authoritative.previousPresent && !previous && receipt && expected?.action !== "rollback-cleanup" && expected?.action !== "finalize-cleanup") throw new Error("import backup cleanup 缺少 previous evidence");
       if (previous && (!authoritative.previousPresent || sha256(previous) !== authoritative.previousHash)) throw new Error("import backup cleanup previous hash 不匹配");
-    } finally { previous?.fill(0); }
+      if (authoritative.machinePreviousPresent && !previousMachine && receipt && expected?.action !== "rollback-cleanup" && expected?.action !== "finalize-cleanup") throw new Error("import backup cleanup 缺少 previous machine evidence");
+      if (previousMachine && (!authoritative.machinePreviousPresent || sha256(previousMachine) !== authoritative.machinePreviousHash)) throw new Error("import backup cleanup previous machine hash 不匹配");
+    } finally { previous?.fill(0); previousMachine?.fill(0); }
     const receiptSnapshot = receipt ? await snapshotImportFile(importReceiptPath(backupId), "import receipt") : undefined;
     const previousSnapshot = previous ? await snapshotImportFile(importBackupPath(backupId), "import previous backup") : undefined;
+    const previousMachineSnapshot = previousMachine ? await snapshotImportFile(importMachineBackupPath(backupId), "import previous machine ID backup") : undefined;
     if (receiptSnapshot) await recheckImportFile(importReceiptPath(backupId), "import receipt", receiptSnapshot);
     if (previousSnapshot) await recheckImportFile(importBackupPath(backupId), "import previous backup", previousSnapshot);
+    if (previousMachineSnapshot) await recheckImportFile(importMachineBackupPath(backupId), "import previous machine ID backup", previousMachineSnapshot);
     await removeIfExists(importBackupPath(backupId));
+    await removeIfExists(importMachineBackupPath(backupId));
     await removeIfExists(importReceiptPath(backupId));
     await rmdir(dir);
     await syncConfigDir();
@@ -1871,7 +1940,10 @@ export function createConfigStore(machineId: string, env: Record<string, string 
       current?.fill(0);
       const previousMatches = receipt.previousPresent ? currentHash === receipt.previousHash : currentHash === undefined;
       if (names.length === 1 && names[0] === "receipt.json") {
-        if (!receipt.previousPresent && currentHash === receipt.targetHash) return; // 首次导入的完整 committed receipt。
+        if (!receipt.previousPresent && currentHash === receipt.targetHash) {
+          await ensureMachineTarget(receipt);
+          return;
+        } // 首次导入的完整 committed receipt。
         if (!previousMatches) throw new Error("不完整 import backup 与当前 config 不一致");
         const receiptSnapshot = await snapshotImportFile(importReceiptPath(backupId), "import receipt");
         const recheckedReceipt = await readImportRecord(importReceiptPath(backupId), "import receipt");
@@ -1884,9 +1956,13 @@ export function createConfigStore(machineId: string, env: Record<string, string 
       }
       const bundle = await readValidatedImportBundle(backupId);
       try {
-        if (currentHash === bundle.record.targetHash) return; // 已提交 receipt，等待显式 rollback/finalize。
+        if (currentHash === bundle.record.targetHash) {
+          await ensureMachineTarget(bundle.record);
+          return;
+        } // 已提交 receipt，等待显式 rollback/finalize。
         if (previousMatches) {
           // backup 已 durable 但 pending 尚未发布：网络/目标均未变化，可幂等撤销孤立备份。
+          await restoreMachinePrevious(bundle.record, bundle.previousMachine);
           await removeImportBundle(bundle.record.backupId);
           return;
         }
@@ -2227,16 +2303,23 @@ export function createConfigStore(machineId: string, env: Record<string, string 
         if ((await listImportBackupIds()).length > 0) throw new Error("存在未 finalize 的 import backup");
         const current = await readSecureBytes(configPath, "config 凭据路径");
         const currentSnapshot = current ? await snapshotImportFile(configPath, "config 凭据路径") : undefined;
+        const currentMachine = await readSecureBytes(machineIdPath, "machine ID 文件");
+        const currentMachineSnapshot = currentMachine ? await snapshotImportFile(machineIdPath, "machine ID 文件") : undefined;
         let canonical: Buffer | undefined;
+        let targetMachine: Buffer | undefined;
         try {
           if (current && !replace) throw new Error("目标凭据已存在，必须显式使用 --replace");
           canonical = Buffer.from(`${JSON.stringify(validate(v, machineIdHash))}\n`, "utf8");
+          targetMachine = Buffer.from(`${machineId}\n`, "utf8");
           const record: ImportRecord = {
             version: 1,
             backupId: randomUUID(),
             previousPresent: current !== undefined,
             previousHash: current ? sha256(current) : undefined,
+            machinePreviousPresent: currentMachine !== undefined,
+            machinePreviousHash: currentMachine ? sha256(currentMachine) : undefined,
             targetHash: sha256(canonical),
+            targetMachineHash: sha256(targetMachine),
             action: "apply",
           };
           const backupDir = importBackupDir(record.backupId);
@@ -2246,17 +2329,24 @@ export function createConfigStore(machineId: string, env: Record<string, string 
           await writeAtomicBytes(importReceiptPath(record.backupId), Buffer.from(`${JSON.stringify(record)}\n`, "utf8"), false);
           await dependencies.onImportPhase?.("after-receipt");
           if (current) await writeAtomicBytes(importBackupPath(record.backupId), current, false);
+          if (currentMachine) await writeAtomicBytes(importMachineBackupPath(record.backupId), currentMachine, false);
           await dependencies.onImportPhase?.("after-backup");
           await writeAtomicBytes(importPendingPath, Buffer.from(`${JSON.stringify(record)}\n`, "utf8"));
           await dependencies.onImportPhase?.("after-pending");
           await requireImportTargetUnchanged(currentSnapshot);
+          if (currentMachineSnapshot) await recheckImportFile(machineIdPath, "machine ID 文件", currentMachineSnapshot);
+          else {
+            try { await lstat(machineIdPath); throw new Error("machine ID 文件在 import mutation 前被创建"); }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+          }
           await writeAtomicBytes(configPath, canonical);
+          await writeAtomicBytes(machineIdPath, targetMachine);
           await dependencies.onImportPhase?.("after-replace");
           await removeIfExists(importPendingPath);
           await syncConfigDir();
           await dependencies.onImportPhase?.("after-pending-cleanup");
           return { backupId: record.backupId, replaced: record.previousPresent };
-        } finally { current?.fill(0); canonical?.fill(0); }
+        } finally { current?.fill(0); currentMachine?.fill(0); canonical?.fill(0); targetMachine?.fill(0); }
       });
     },
     async rollbackImport(backupId) {
@@ -2280,11 +2370,12 @@ export function createConfigStore(machineId: string, env: Record<string, string 
           await recheckImportTargetContent(currentSnapshot, bundle.record.targetHash);
           if (bundle.record.previousPresent) await writeAtomicBytes(configPath, bundle.previous!);
           else { await unlink(configPath); await syncConfigDir(); }
+          await restoreMachinePrevious(bundle.record, bundle.previousMachine);
           await dependencies.onImportPhase?.("after-rollback-replace");
           await cleanupImportBundle(backupId, cleanupRecord);
           await removeIfExists(importPendingPath);
           await syncConfigDir();
-        } finally { bundle.previous?.fill(0); }
+        } finally { bundle.previous?.fill(0); bundle.previousMachine?.fill(0); }
       });
     },
     async finalizeImport(backupId) {

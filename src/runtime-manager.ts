@@ -5,6 +5,7 @@ import { chmodSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, open
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { request as httpRequest } from "node:http";
+import { readMachineIdFile, resolveMachineIdPath } from "./machine-id.ts";
 
 export type RuntimeEnv = Record<string, string | undefined>;
 export type RuntimeIo = { stdout(value: string): void; stderr(value: string): void };
@@ -61,11 +62,7 @@ function resolveProxyCommand(env: RuntimeEnv): { command: string; args: string[]
   return { command: bun, args: [join(proxyDir, "src/cli.ts"), "serve"], cwd: proxyDir };
 }
 function machineIdFile(env: RuntimeEnv): string {
-  const value = env.QODER_CN_MACHINE_ID_FILE;
-  if (!value) throw new Error("必须显式提供 QODER_CN_MACHINE_ID_FILE");
-  if (!existsSync(value)) throw new Error("Qoder machine ID 文件不可用或不安全");
-  const st = lstatSync(value); if (!st.isFile() || st.isSymbolicLink()) throw new Error("Qoder machine ID 文件不可用或不安全");
-  return value;
+  return resolveMachineIdPath(env);
 }
 async function reservePort(): Promise<number> {
   return await new Promise((resolve, reject) => {
@@ -149,8 +146,10 @@ export class QoderRuntimeManager {
     try { return await startup; } finally { this.inflight.delete(runId); }
   }
   private async startLease(runId: string, ownerPid: number, tier: QoderTier): Promise<{ runId: string; leaseId: string; baseUrl: string; socketPath: string; token: string; tier: QoderTier; routingKey: string }> {
-    const port = await reservePort(); const token = randomBytes(32).toString("hex"); const leaseId = randomBytes(16).toString("hex"); const command = resolveProxyCommand(this.env); const machineId = machineIdFile(this.env); const routingKey = QODER_TIER_REGISTRY[tier].routingKey;
-    const child = spawn(command.command, command.args, { cwd: command.cwd, detached: false, stdio: "ignore", env: { ...process.env, ...this.env, PORT: String(port), QODER_PROXY_API_KEY: token, QODER_CN_MACHINE_ID_FILE: machineId, QODER_CN_INFER_MODEL_KEY: routingKey } });
+    const port = await reservePort(); const token = randomBytes(32).toString("hex"); const leaseId = randomBytes(16).toString("hex"); const command = resolveProxyCommand(this.env); const machineId = machineIdFile(this.env); await readMachineIdFile(machineId); const routingKey = QODER_TIER_REGISTRY[tier].routingKey;
+    const childEnv: RuntimeEnv = { ...process.env, ...this.env, PORT: String(port), QODER_PROXY_API_KEY: token, QODER_CN_MACHINE_ID_FILE: machineId, QODER_CN_INFER_MODEL_KEY: routingKey };
+    delete childEnv.QODER_CN_MACHINE_ID;
+    const child = spawn(command.command, command.args, { cwd: command.cwd, detached: false, stdio: "ignore", env: childEnv });
     const lease: Lease = { runId, token, leaseId, tier, baseUrl: `http://127.0.0.1:${port}`, child, owners: new Set([ownerPid]), invalid: false }; this.leases.set(runId, lease);
     child.once("exit", () => {
       lease.invalid = true;
