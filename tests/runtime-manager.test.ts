@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
@@ -68,6 +68,21 @@ function envFor(fake: { executable: string; starts: string; routes: string; dire
 }
 
 describe("Qoder runtime manager lease lifecycle", () => {
+  it("uses the proxy-owned machine ID after an imported session clears the file override", async () => {
+    const fake = await createFakeProxy();
+    const configDir = join(fake.directory, "config");
+    await mkdir(configDir, { mode: 0o700 });
+    await writeFile(join(configDir, "machine_id"), "machine-test\n", { mode: 0o600 });
+    const env = { ...envFor(fake, join(fake.directory, "runtime.sock"), join(configDir, "machine_id")), QODER_PROXY_CONFIG_DIR: configDir };
+    delete env.QODER_CN_MACHINE_ID_FILE;
+    const manager = new QoderRuntimeManager(env);
+    managers.push(manager);
+    await manager.listen();
+    const lease = await manager.acquire("run-proxy-owned-machine", process.pid);
+    expect(await requestStatus(`${lease.baseUrl}/internal/quota`, lease.token)).toBe(200);
+    manager.release("run-proxy-owned-machine", process.pid, lease.leaseId);
+  });
+
   it("starts independently, reaches readiness, and injects an ephemeral key only in memory", async () => {
     const fake = await createFakeProxy();
     const machineId = join(fake.directory, "machine_id");
