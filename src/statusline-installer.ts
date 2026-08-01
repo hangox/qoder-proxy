@@ -14,7 +14,7 @@ function secureTarget(path: string, allowMode: number): void {
     const parentStat = lstatSync(parent);
     if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) throw new Error(`installer 父目录不安全：${parent}`);
     if (typeof process.getuid === "function" && parentStat.uid !== process.getuid()) throw new Error(`installer 父目录所有者不匹配：${parent}`);
-    if ((parentStat.mode & 0o077) !== 0) throw new Error(`installer 父目录权限不安全：${parent}`);
+    if ((parentStat.mode & 0o022) !== 0) throw new Error(`installer 父目录权限不安全：${parent}`);
   }
 
   const stat = lstatSync(path);

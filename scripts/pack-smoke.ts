@@ -30,8 +30,10 @@ try {
   const link = await stat(executable);
   const installerLink = await stat(installer);
   if ((!link.isFile() && !link.isSymbolicLink()) || (!installerLink.isFile() && !installerLink.isSymbolicLink())) throw new Error("安装包 bin 缺失");
-  const hook = join(temp, "statusline.ts");
-  const helper = join(temp, "qoder-statusline-runtime.ts");
+  const hookDir = join(temp, "hooks");
+  await mkdir(hookDir, { mode: 0o755 });
+  const hook = join(hookDir, "statusline.ts");
+  const helper = join(hookDir, "qoder-statusline-runtime.ts");
   await writeFile(hook, "#!/usr/bin/env bun\nconsole.log('legacy');\n", { mode: 0o700 });
   const installSmoke = run(installer, [], project);
   if (installSmoke.status === 0) throw new Error("缺少显式 installer target 应 fail-closed");

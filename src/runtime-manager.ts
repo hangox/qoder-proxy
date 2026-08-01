@@ -158,7 +158,14 @@ export class QoderRuntimeManager {
     });
     try { await waitReady(lease.baseUrl, token); return { runId, leaseId, baseUrl: lease.baseUrl, socketPath: socketPath(this.env), token, tier, routingKey }; } catch (error) { this.leases.delete(runId); killChild(child); throw error; }
   }
-  release(runId: string, ownerPid: number, leaseId?: string): void { const lease = this.leases.get(runId); if (!lease || (leaseId !== undefined && lease.leaseId !== leaseId)) return; lease.owners.delete(ownerPid); if (lease.owners.size === 0) { this.leases.delete(runId); killChild(lease.child); this.armIdleExit(); } }
+  release(runId: string, ownerPid: number, leaseId?: string): void {
+    const lease = this.leases.get(runId);
+    if (!lease) return;
+    if (!alive(ownerPid)) return;
+    if (leaseId !== undefined && lease.leaseId !== leaseId) return;
+    lease.owners.delete(ownerPid);
+    if (lease.owners.size === 0) { this.leases.delete(runId); killChild(lease.child); this.armIdleExit(); }
+  }
   reapDeadOwners(): void { for (const [runId, lease] of this.leases) { for (const owner of lease.owners) if (!alive(owner)) lease.owners.delete(owner); if (lease.owners.size === 0) { this.leases.delete(runId); killChild(lease.child); } } if (this.leases.size === 0) this.armIdleExit(); }
   private armIdleExit(): void { if (this.idleTimer || this.leases.size > 0) return; this.idleTimer = setTimeout(() => void this.stop(), IDLE_TIMEOUT_MS); }
   async listen(): Promise<void> {
