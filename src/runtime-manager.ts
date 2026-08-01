@@ -1,7 +1,7 @@
 // Qoder session runtime manager：代理与临时认证只存在 daemon 内存中。
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { request as httpRequest } from "node:http";
@@ -102,12 +102,16 @@ async function waitChildExit(child: ChildProcess): Promise<void> {
   });
 }
 function alive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch { return false; } }
-function lockOwnerPid(path: string): number | undefined {
+function lockRecord(path: string): { pid: number; nonce: string; inode: bigint } | undefined {
   try {
-    const mode = statSync(path).mode & 0o777;
-    if (mode !== 0o600) return undefined;
-    const parsed = Number(readFileSync(path, "utf8").trim());
-    return validOwnerPid(parsed) ? parsed : undefined;
+    const fd = openSync(path, "r");
+    try {
+      const stat = fstatSync(fd);
+      if ((stat.mode & 0o777) !== 0o600) return undefined;
+      const [pidText, nonce] = readFileSync(fd, "utf8").trim().split("\n");
+      const pid = Number(pidText);
+      return validOwnerPid(pid) && /^[0-9a-f]{32}$/.test(nonce || "") ? { pid, nonce: nonce!, inode: BigInt(stat.ino) } : undefined;
+    } finally { closeSync(fd); }
   } catch { return undefined; }
 }
 
@@ -117,6 +121,8 @@ export class QoderRuntimeManager {
   private readonly env: RuntimeEnv;
   private server: Server | undefined;
   private lockFd: number | undefined;
+  private lockNonce: string | undefined;
+  private socketInode: bigint | undefined;
   private idleTimer: NodeJS.Timeout | undefined;
   private reaper: NodeJS.Timeout | undefined;
   private stopped = false;
@@ -153,29 +159,42 @@ export class QoderRuntimeManager {
       if (dirname(socketPath(this.env)) !== directory) throw new Error("runtime socket 必须位于受保护目录");
     } catch { throw new Error("runtime 目录不可用"); }
     const path = socketPath(this.env);
-    try {
-      this.lockFd = openSync(lockPath(this.env), "wx", 0o600);
-      writeFileSync(this.lockFd, `${process.pid}\n`, { encoding: "utf8" });
-    } catch {
-      if (this.lockFd !== undefined) { closeSync(this.lockFd); this.lockFd = undefined; }
-      try { const probe = await socketClient({ op: "ping" }, this.env); if (probe.ok) throw new Error("runtime daemon 已在运行"); } catch (error) { if (error instanceof Error && error.message === "runtime daemon 已在运行") throw error; }
-      const owner = lockOwnerPid(lockPath(this.env));
-      if (owner !== undefined && alive(owner)) throw new Error("runtime daemon 锁被占用");
-      try { unlinkSync(lockPath(this.env)); } catch {}
+    const lock = lockPath(this.env);
+    const takeLock = (): void => {
+      const nonce = randomBytes(16).toString("hex");
+      const fd = openSync(lock, "wx", 0o600);
       try {
-        this.lockFd = openSync(lockPath(this.env), "wx", 0o600);
-        writeFileSync(this.lockFd, `${process.pid}\n`, { encoding: "utf8" });
-      } catch { throw new Error("runtime daemon 锁被占用"); }
+        writeFileSync(fd, `${process.pid}\n${nonce}\n`, { encoding: "utf8" });
+        this.lockFd = fd;
+        this.lockNonce = nonce;
+      } catch (error) {
+        closeSync(fd);
+        try { unlinkSync(lock); } catch {}
+        throw error;
+      }
+    };
+    try { takeLock(); }
+    catch {
+      try { const probe = await socketClient({ op: "ping" }, this.env); if (probe.ok) throw new Error("runtime daemon 已在运行"); } catch (error) { if (error instanceof Error && error.message === "runtime daemon 已在运行") throw error; }
+      const record = lockRecord(lock);
+      if (record !== undefined && alive(record.pid)) throw new Error("runtime daemon 锁被占用");
+      if (record !== undefined) {
+        try {
+          const current = statSync(lock);
+          if (BigInt(current.ino) === record.inode && lockRecord(lock)?.nonce === record.nonce) unlinkSync(lock);
+        } catch {}
+      }
+      try { takeLock(); } catch { throw new Error("runtime daemon 锁被占用"); }
     }
     if (existsSync(path)) {
       try {
         const mode = statSync(path).mode & 0o777;
         if (mode !== 0o600) throw new Error("runtime socket 权限不安全");
-      } catch { closeSync(this.lockFd); this.lockFd = undefined; throw new Error("runtime socket 不可用"); }
-      closeSync(this.lockFd); this.lockFd = undefined; throw new Error("runtime socket 已存在");
+      } catch { if (this.lockFd !== undefined) closeSync(this.lockFd); this.lockFd = undefined; throw new Error("runtime socket 不可用"); }
+      if (this.lockFd !== undefined) closeSync(this.lockFd); this.lockFd = undefined; throw new Error("runtime socket 已存在");
     }
     this.server = createServer((socket) => this.handle(socket));
-    await new Promise<void>((resolve, reject) => { this.server!.once("error", reject); this.server!.listen(path, () => { try { chmodSync(path, 0o600); } catch {} resolve(); }); });
+    await new Promise<void>((resolve, reject) => { this.server!.once("error", reject); this.server!.listen(path, () => { try { chmodSync(path, 0o600); this.socketInode = BigInt(statSync(path).ino); } catch {} resolve(); }); });
     this.reaper = setInterval(() => this.reapDeadOwners(), reaperIntervalMs(this.env)); this.reaper.unref();
     this.server.once("close", () => { this.stopped = true; });
   }
@@ -216,8 +235,20 @@ export class QoderRuntimeManager {
     await Promise.all(children.map(waitChildExit));
     this.leases.clear();
     await new Promise<void>((resolve) => this.server?.close(() => resolve()) ?? resolve());
-    const path = socketPath(this.env); try { if (existsSync(path)) unlinkSync(path); } catch {}
-    if (this.lockFd !== undefined) { closeSync(this.lockFd); this.lockFd = undefined; try { unlinkSync(lockPath(this.env)); } catch {} }
+    const path = socketPath(this.env);
+    try {
+      if (existsSync(path) && this.socketInode !== undefined && BigInt(statSync(path).ino) === this.socketInode) unlinkSync(path);
+    } catch {}
+    if (this.lockFd !== undefined) {
+      closeSync(this.lockFd);
+      this.lockFd = undefined;
+      try {
+        const record = lockRecord(lockPath(this.env));
+        if (record?.pid === process.pid && record.nonce === this.lockNonce) unlinkSync(lockPath(this.env));
+      } catch {}
+      this.lockNonce = undefined;
+    }
+    this.socketInode = undefined;
     this.server = undefined;
     this.stopped = true;
   }
