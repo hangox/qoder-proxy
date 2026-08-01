@@ -176,7 +176,12 @@ export class QoderRuntimeManager {
   private async dispatch(socket: Socket, request: RuntimeRequest): Promise<void> {
     try {
       if (request.op === "ping") { socket.end('{"ok":true}\n'); return; }
-      if (request.op === "status") { socket.end(JSON.stringify({ ok: true, active: this.leases.size > 0 }) + "\n"); return; }
+      if (request.op === "status") {
+        if (!validRunId(request.runId) || !validOwnerPid(request.ownerPid)) throw new Error("非法 runtime run/owner");
+        const lease = this.leases.get(request.runId);
+        const active = !!lease && !lease.invalid && lease.owners.has(request.ownerPid) && alive(request.ownerPid);
+        socket.end(JSON.stringify({ ok: true, active }) + "\n"); return;
+      }
       if (request.op === "acquire") { const result = await this.acquire(request.runId || "", request.ownerPid || 0); socket.end(JSON.stringify({ ok: true, ...result }) + "\n"); return; }
       if (request.op === "release") { this.release(request.runId || "", request.ownerPid || 0); socket.end('{"ok":true}\n'); return; }
       if (request.op === "shutdown") { await this.stop(); socket.end('{"ok":true}\n'); return; }
@@ -203,7 +208,7 @@ function socketClient(request: RuntimeRequest, env: RuntimeEnv): Promise<Runtime
 async function startDaemon(env: RuntimeEnv): Promise<void> { const script = process.argv[1]; if (!script) throw new Error("runtime CLI entry unavailable"); const child = spawn(process.execPath, [script, "runtime", "daemon"], { detached: true, stdio: "ignore", env: { ...process.env, ...env } }); child.unref(); }
 export async function runRuntimeCommand(args: string[], env: RuntimeEnv = process.env, io: RuntimeIo = { stdout: (value) => process.stdout.write(value), stderr: (value) => process.stderr.write(value) }): Promise<void> {
   const command = args[0]; if (command === "daemon") { const manager = new QoderRuntimeManager(env); await manager.listen(); process.on("SIGTERM", () => void manager.stop().then(() => process.exit(0))); process.on("SIGINT", () => void manager.stop().then(() => process.exit(0))); await new Promise(() => {}); }
-  if (command !== "acquire" && command !== "release" && command !== "shutdown") throw new Error("runtime 用法：acquire|release|shutdown");
+  if (command !== "acquire" && command !== "release" && command !== "shutdown" && command !== "status") throw new Error("runtime 用法：acquire|release|status|shutdown");
   const request: RuntimeRequest = { op: command, runId: args[1], ownerPid: Number(args[2] || process.ppid) }; let response: RuntimeResponse | undefined;
   for (let attempt = 0; attempt < 4 && !response; attempt++) { try { response = await socketClient(request, env); } catch { if (attempt === 0) await startDaemon(env); await new Promise((resolve) => setTimeout(resolve, 100)); } }
   if (!response) throw new Error("runtime daemon 启动超时"); if (!response.ok) throw new Error(response.error); if (command === "acquire") io.stdout(`${JSON.stringify({ baseUrl: response.baseUrl, token: response.token })}\n`);
