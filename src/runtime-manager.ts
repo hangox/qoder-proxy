@@ -194,9 +194,14 @@ export class QoderRuntimeManager {
       if (this.lockFd !== undefined) closeSync(this.lockFd); this.lockFd = undefined; throw new Error("runtime socket 已存在");
     }
     this.server = createServer((socket) => this.handle(socket));
-    await new Promise<void>((resolve, reject) => { this.server!.once("error", reject); this.server!.listen(path, () => { try { chmodSync(path, 0o600); this.socketInode = BigInt(statSync(path).ino); } catch {} resolve(); }); });
-    this.reaper = setInterval(() => this.reapDeadOwners(), reaperIntervalMs(this.env)); this.reaper.unref();
-    this.server.once("close", () => { this.stopped = true; });
+    try {
+      await new Promise<void>((resolve, reject) => { this.server!.once("error", reject); this.server!.listen(path, () => { try { chmodSync(path, 0o600); this.socketInode = BigInt(statSync(path).ino); } catch {} resolve(); }); });
+      this.reaper = setInterval(() => this.reapDeadOwners(), reaperIntervalMs(this.env)); this.reaper.unref();
+      this.server.once("close", () => { this.stopped = true; });
+    } catch (error) {
+      await this.stop();
+      throw error;
+    }
   }
   private handle(socket: Socket): void {
     let data = "";
