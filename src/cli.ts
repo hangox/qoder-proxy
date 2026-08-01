@@ -8,6 +8,7 @@ import { DEFAULT_QODER_SOURCE_DIR, importStore, prepareQoderImport, readMachineI
 import { logger } from "./logger.ts";
 import { createRoutingAttestation } from "./attestation.ts";
 import type { RoutingAttestation } from "./attestation.ts";
+import { runRuntimeCommand } from "./runtime-manager.ts";
 
 const DEFAULT_PREFLIGHT_RETRY_MS = 1_000;
 const DEFAULT_SHUTDOWN_DRAIN_MS = 5_000;
@@ -147,6 +148,10 @@ export async function runCli(
   signal?: AbortSignal,
 ): Promise<CliRuntime | undefined> {
   const command = args[0];
+  if (command === "runtime") {
+    await runRuntimeCommand(args.slice(1), env, io);
+    return undefined;
+  }
   if (command === undefined || command === "serve") {
     if (args.length > (command === "serve" ? 1 : 0)) throw new Error("serve 不接受额外参数");
     if (!env.QODER_PROXY_API_KEY) throw new Error("QODER_PROXY_API_KEY 未设置");
