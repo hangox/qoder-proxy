@@ -1,19 +1,22 @@
 // Qoder session runtime manager：代理与临时认证只存在 daemon 内存中。
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, unlinkSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { request as httpRequest } from "node:http";
 
 export type RuntimeEnv = Record<string, string | undefined>;
 export type RuntimeIo = { stdout(value: string): void; stderr(value: string): void };
-type RuntimeRequest = { op: "acquire" | "release" | "shutdown"; runId?: string; ownerPid?: number };
-type RuntimeResponse = { ok: true; baseUrl?: string; token?: string } | { ok: false; error: string };
-type Lease = { runId: string; token: string; baseUrl: string; child: ChildProcess; owners: Set<number> };
+type RuntimeRequest = { op: "acquire" | "release" | "shutdown" | "ping" | "status"; runId?: string; ownerPid?: number };
+type RuntimeResponse = { ok: true; active?: boolean; baseUrl?: string; token?: string } | { ok: false; error: string };
+type Lease = { runId: string; token: string; baseUrl: string; child: ChildProcess; owners: Set<number>; invalid: boolean };
 
-const socketPath = (env: RuntimeEnv = process.env): string => env.QODER_PROXY_RUNTIME_SOCKET || join(env.TMPDIR || "/tmp", `qoder-proxy-runtime-${typeof process.getuid === "function" ? process.getuid() : "user"}.sock`);
+const runtimeDirectory = (env: RuntimeEnv = process.env): string => env.QODER_PROXY_RUNTIME_DIR || (env.QODER_PROXY_RUNTIME_SOCKET ? dirname(env.QODER_PROXY_RUNTIME_SOCKET) : join(env.TMPDIR || "/tmp", `qoder-proxy-runtime-${typeof process.getuid === "function" ? process.getuid() : "user"}`));
+const socketPath = (env: RuntimeEnv = process.env): string => env.QODER_PROXY_RUNTIME_SOCKET || join(runtimeDirectory(env), "runtime.sock");
+const lockPath = (env: RuntimeEnv = process.env): string => join(runtimeDirectory(env), "daemon.lock");
 const READY_TIMEOUT_MS = 20_000;
+const MAX_FRAME_BYTES = 16 * 1024;
 const CLIENT_TIMEOUT_MS = 2_000;
 const IDLE_TIMEOUT_MS = 3_000;
 const DEFAULT_REAPER_MS = 500;
@@ -81,18 +84,30 @@ async function waitChildExit(child: ChildProcess): Promise<void> {
   });
 }
 function alive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch { return false; } }
+function lockOwnerPid(path: string): number | undefined {
+  try {
+    const mode = statSync(path).mode & 0o777;
+    if (mode !== 0o600) return undefined;
+    const parsed = Number(readFileSync(path, "utf8").trim());
+    return validOwnerPid(parsed) ? parsed : undefined;
+  } catch { return undefined; }
+}
 
 export class QoderRuntimeManager {
   private readonly leases = new Map<string, Lease>();
   private readonly inflight = new Map<string, Promise<{ baseUrl: string; token: string }>>();
   private readonly env: RuntimeEnv;
   private server: Server | undefined;
+  private lockFd: number | undefined;
   private idleTimer: NodeJS.Timeout | undefined;
   private reaper: NodeJS.Timeout | undefined;
+  private stopped = false;
   constructor(env: RuntimeEnv = process.env) { this.env = env; }
+  isStopped(): boolean { return this.stopped; }
   async acquire(runId: string, ownerPid: number): Promise<{ baseUrl: string; token: string }> {
-    if (!validRunId(runId) || !validOwnerPid(ownerPid)) throw new Error("非法 runtime run/owner");
-    const existing = this.leases.get(runId); if (existing) { existing.owners.add(ownerPid); return { baseUrl: existing.baseUrl, token: existing.token }; }
+    if (!validRunId(runId) || !validOwnerPid(ownerPid) || !alive(ownerPid)) throw new Error("非法 runtime run/owner");
+    if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = undefined; }
+    const existing = this.leases.get(runId); if (existing) { if (existing.invalid) { this.leases.delete(runId); throw new Error("runtime lease 已失效"); } existing.owners.add(ownerPid); return { baseUrl: existing.baseUrl, token: existing.token }; }
     const pending = this.inflight.get(runId); if (pending) { const result = await pending; const lease = this.leases.get(runId); if (!lease) throw new Error("runtime lease lost"); lease.owners.add(ownerPid); return result; }
     const startup = this.startLease(runId, ownerPid); this.inflight.set(runId, startup);
     try { return await startup; } finally { this.inflight.delete(runId); }
@@ -100,33 +115,91 @@ export class QoderRuntimeManager {
   private async startLease(runId: string, ownerPid: number): Promise<{ baseUrl: string; token: string }> {
     const port = await reservePort(); const token = randomBytes(32).toString("hex"); const command = resolveProxyCommand(this.env); const machineId = machineIdFile(this.env);
     const child = spawn(command.command, command.args, { cwd: command.cwd, detached: false, stdio: "ignore", env: { ...process.env, ...this.env, PORT: String(port), QODER_PROXY_API_KEY: token, QODER_CN_MACHINE_ID_FILE: machineId, QODER_CN_INFER_MODEL_KEY: "qmodel_preview" } });
-    const lease: Lease = { runId, token, baseUrl: `http://127.0.0.1:${port}`, child, owners: new Set([ownerPid]) }; this.leases.set(runId, lease);
+    const lease: Lease = { runId, token, baseUrl: `http://127.0.0.1:${port}`, child, owners: new Set([ownerPid]), invalid: false }; this.leases.set(runId, lease);
+    child.once("exit", () => {
+      lease.invalid = true;
+      if (this.leases.get(runId) === lease) { this.leases.delete(runId); this.armIdleExit(); }
+    });
     try { await waitReady(lease.baseUrl, token); return { baseUrl: lease.baseUrl, token }; } catch (error) { this.leases.delete(runId); killChild(child); throw error; }
   }
   release(runId: string, ownerPid: number): void { const lease = this.leases.get(runId); if (!lease) return; lease.owners.delete(ownerPid); if (lease.owners.size === 0) { this.leases.delete(runId); killChild(lease.child); this.armIdleExit(); } }
   reapDeadOwners(): void { for (const [runId, lease] of this.leases) { for (const owner of lease.owners) if (!alive(owner)) lease.owners.delete(owner); if (lease.owners.size === 0) { this.leases.delete(runId); killChild(lease.child); } } if (this.leases.size === 0) this.armIdleExit(); }
   private armIdleExit(): void { if (this.idleTimer || this.leases.size > 0) return; this.idleTimer = setTimeout(() => void this.stop(), IDLE_TIMEOUT_MS); }
   async listen(): Promise<void> {
-    const path = socketPath(this.env); try { if (existsSync(path)) unlinkSync(path); } catch { /* stale socket is fail-closed */ }
+    if (this.server || this.stopped) throw new Error("runtime manager 已停止或已启动");
+    const directory = runtimeDirectory(this.env);
+    try {
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      chmodSync(directory, 0o700);
+      if (dirname(socketPath(this.env)) !== directory) throw new Error("runtime socket 必须位于受保护目录");
+    } catch { throw new Error("runtime 目录不可用"); }
+    const path = socketPath(this.env);
+    try {
+      this.lockFd = openSync(lockPath(this.env), "wx", 0o600);
+      writeFileSync(this.lockFd, `${process.pid}\n`, { encoding: "utf8" });
+    } catch {
+      if (this.lockFd !== undefined) { closeSync(this.lockFd); this.lockFd = undefined; }
+      try { const probe = await socketClient({ op: "ping" }, this.env); if (probe.ok) throw new Error("runtime daemon 已在运行"); } catch (error) { if (error instanceof Error && error.message === "runtime daemon 已在运行") throw error; }
+      const owner = lockOwnerPid(lockPath(this.env));
+      if (owner !== undefined && alive(owner)) throw new Error("runtime daemon 锁被占用");
+      try { unlinkSync(lockPath(this.env)); } catch {}
+      try {
+        this.lockFd = openSync(lockPath(this.env), "wx", 0o600);
+        writeFileSync(this.lockFd, `${process.pid}\n`, { encoding: "utf8" });
+      } catch { throw new Error("runtime daemon 锁被占用"); }
+    }
+    if (existsSync(path)) {
+      try {
+        const mode = statSync(path).mode & 0o777;
+        if (mode !== 0o600) throw new Error("runtime socket 权限不安全");
+      } catch { closeSync(this.lockFd); this.lockFd = undefined; throw new Error("runtime socket 不可用"); }
+      closeSync(this.lockFd); this.lockFd = undefined; throw new Error("runtime socket 已存在");
+    }
     this.server = createServer((socket) => this.handle(socket));
     await new Promise<void>((resolve, reject) => { this.server!.once("error", reject); this.server!.listen(path, () => { try { chmodSync(path, 0o600); } catch {} resolve(); }); });
     this.reaper = setInterval(() => this.reapDeadOwners(), reaperIntervalMs(this.env)); this.reaper.unref();
+    this.server.once("close", () => { this.stopped = true; });
   }
-  private handle(socket: Socket): void { let data = ""; socket.setEncoding("utf8"); socket.on("data", (chunk) => { data += chunk; const newline = data.indexOf("\n"); if (newline < 0) return; let request: RuntimeRequest; try { request = JSON.parse(data.slice(0, newline)) as RuntimeRequest; } catch { socket.end('{"ok":false,"error":"invalid runtime request"}\n'); return; } void this.dispatch(socket, request); }); }
-  private async dispatch(socket: Socket, request: RuntimeRequest): Promise<void> { try { if (request.op === "acquire") { const result = await this.acquire(request.runId || "", request.ownerPid || 0); socket.end(JSON.stringify({ ok: true, ...result }) + "\n"); return; } if (request.op === "release") { this.release(request.runId || "", request.ownerPid || 0); socket.end('{"ok":true}\n'); return; } if (request.op === "shutdown") { await this.stop(); socket.end('{"ok":true}\n'); return; } throw new Error("未知 runtime 操作"); } catch (error) { socket.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : "runtime failed" }) + "\n"); } }
+  private handle(socket: Socket): void {
+    let data = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      data += chunk;
+      if (Buffer.byteLength(data, "utf8") > MAX_FRAME_BYTES) { socket.end('{"ok":false,"error":"runtime frame too large"}\n'); return; }
+      const newline = data.indexOf("\n");
+      if (newline < 0) return;
+      let request: RuntimeRequest;
+      try { request = JSON.parse(data.slice(0, newline)) as RuntimeRequest; } catch { socket.end('{"ok":false,"error":"invalid runtime request"}\n'); return; }
+      void this.dispatch(socket, request);
+    });
+  }
+  private async dispatch(socket: Socket, request: RuntimeRequest): Promise<void> {
+    try {
+      if (request.op === "ping") { socket.end('{"ok":true}\n'); return; }
+      if (request.op === "status") { socket.end(JSON.stringify({ ok: true, active: this.leases.size > 0 }) + "\n"); return; }
+      if (request.op === "acquire") { const result = await this.acquire(request.runId || "", request.ownerPid || 0); socket.end(JSON.stringify({ ok: true, ...result }) + "\n"); return; }
+      if (request.op === "release") { this.release(request.runId || "", request.ownerPid || 0); socket.end('{"ok":true}\n'); return; }
+      if (request.op === "shutdown") { await this.stop(); socket.end('{"ok":true}\n'); return; }
+      throw new Error("未知 runtime 操作");
+    } catch (error) { socket.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : "runtime failed" }) + "\n"); }
+  }
   async stop(): Promise<void> {
-    if (this.idleTimer) clearTimeout(this.idleTimer);
+    if (this.stopped && !this.server) return;
+    if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = undefined; }
     if (this.reaper) clearInterval(this.reaper);
-    const children = [...this.leases.values()].map((lease) => lease.child);
+    const children = [...new Set([...this.leases.values()].map((lease) => lease.child))];
     for (const child of children) killChild(child);
     await Promise.all(children.map(waitChildExit));
     this.leases.clear();
     await new Promise<void>((resolve) => this.server?.close(() => resolve()) ?? resolve());
     const path = socketPath(this.env); try { if (existsSync(path)) unlinkSync(path); } catch {}
+    if (this.lockFd !== undefined) { closeSync(this.lockFd); this.lockFd = undefined; try { unlinkSync(lockPath(this.env)); } catch {} }
+    this.server = undefined;
+    this.stopped = true;
   }
 }
 
-function socketClient(request: RuntimeRequest, env: RuntimeEnv): Promise<RuntimeResponse> { return new Promise((resolve, reject) => { const socket = createConnection(socketPath(env)); let data = ""; const timer = setTimeout(() => { socket.destroy(); reject(new Error("runtime daemon unavailable")); }, CLIENT_TIMEOUT_MS); socket.setEncoding("utf8"); socket.on("error", (error) => { clearTimeout(timer); reject(error); }); socket.on("data", (chunk) => { data += chunk; const newline = data.indexOf("\n"); if (newline < 0) return; clearTimeout(timer); socket.end(); try { resolve(JSON.parse(data.slice(0, newline)) as RuntimeResponse); } catch (error) { reject(error); } }); socket.write(JSON.stringify(request) + "\n"); }); }
+function socketClient(request: RuntimeRequest, env: RuntimeEnv): Promise<RuntimeResponse> { return new Promise((resolve, reject) => { const socket = createConnection(socketPath(env)); let data = ""; const timer = setTimeout(() => { socket.destroy(); reject(new Error("runtime daemon unavailable")); }, CLIENT_TIMEOUT_MS); socket.setEncoding("utf8"); socket.on("error", (error) => { clearTimeout(timer); reject(error); }); socket.on("data", (chunk) => { data += chunk; if (Buffer.byteLength(data, "utf8") > MAX_FRAME_BYTES) { clearTimeout(timer); socket.destroy(); reject(new Error("runtime frame too large")); return; } const newline = data.indexOf("\n"); if (newline < 0) return; clearTimeout(timer); socket.end(); try { resolve(JSON.parse(data.slice(0, newline)) as RuntimeResponse); } catch (error) { reject(error); } }); socket.write(JSON.stringify(request) + "\n"); }); }
 async function startDaemon(env: RuntimeEnv): Promise<void> { const script = process.argv[1]; if (!script) throw new Error("runtime CLI entry unavailable"); const child = spawn(process.execPath, [script, "runtime", "daemon"], { detached: true, stdio: "ignore", env: { ...process.env, ...env } }); child.unref(); }
 export async function runRuntimeCommand(args: string[], env: RuntimeEnv = process.env, io: RuntimeIo = { stdout: (value) => process.stdout.write(value), stderr: (value) => process.stderr.write(value) }): Promise<void> {
   const command = args[0]; if (command === "daemon") { const manager = new QoderRuntimeManager(env); await manager.listen(); process.on("SIGTERM", () => void manager.stop().then(() => process.exit(0))); process.on("SIGINT", () => void manager.stop().then(() => process.exit(0))); await new Promise(() => {}); }

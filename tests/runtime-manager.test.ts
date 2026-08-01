@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -89,7 +90,12 @@ describe("Qoder runtime manager lease lifecycle", () => {
     managers.push(manager);
     await manager.listen();
 
-    const owners = Array.from({ length: 8 }, (_, index) => process.pid + index + 1);
+    const ownerChildren: ChildProcess[] = [];
+    const owners = Array.from({ length: 8 }, () => {
+      const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], { stdio: "ignore" });
+      ownerChildren.push(child);
+      return child.pid!;
+    });
     const leases = await Promise.all(owners.map((owner) => manager.acquire("run-shared", owner)));
     expect(new Set(leases.map((lease) => lease.baseUrl))).toHaveLength(1);
     expect(new Set(leases.map((lease) => lease.token))).toHaveLength(1);
@@ -108,6 +114,7 @@ describe("Qoder runtime manager lease lifecycle", () => {
       if (!stopped) await new Promise((resolve) => setTimeout(resolve, 50));
     }
     expect(stopped).toBe(true);
+    for (const child of ownerChildren) child.kill("SIGTERM");
   });
 
   it("uses distinct credentials per run and rejects cross-run keys", async () => {
