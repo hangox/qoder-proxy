@@ -1913,7 +1913,7 @@ export function createConfigStore(machineId: string, env: Record<string, string 
   const removeImportBundle = async (backupId: string): Promise<void> => {
     const bundle = await readValidatedImportBundle(backupId);
     try { await cleanupImportBundle(backupId, bundle.record); }
-    finally { bundle.previous?.fill(0); }
+    finally { bundle.previous?.fill(0); bundle.previousMachine?.fill(0); }
   };
   const assertNoRotationEvidence = async (): Promise<void> => {
     if (await readReservation() || await readRotationRecord(rotationPath, "rotation journal") || await readRotationRecord(emergencyRotationPath, "emergency rotation journal") || (await listRotationTempNames()).length > 0) throw new Error("凭据轮换证据存在，拒绝 import 操作");
@@ -1967,7 +1967,7 @@ export function createConfigStore(machineId: string, env: Record<string, string 
           return;
         }
         throw new Error("孤立 import backup 与当前 config 不一致");
-      } finally { bundle.previous?.fill(0); }
+      } finally { bundle.previous?.fill(0); bundle.previousMachine?.fill(0); }
     }
     if ((pending.action === "rollback-cleanup" || pending.action === "finalize-cleanup") && (ids.length === 0 || (ids.length === 1 && ids[0] === pending.backupId))) {
       const current = await readSecureBytes(configPath, "config 凭据路径");
@@ -1975,6 +1975,8 @@ export function createConfigStore(machineId: string, env: Record<string, string 
       current?.fill(0);
       if (pending.action === "finalize-cleanup") {
         if (currentHash !== pending.targetHash) throw new Error("import finalize 恢复时目标 config 已被第三方修改");
+        const machineHash = await readMachineHash();
+        if (machineHash !== pending.targetMachineHash) throw new Error("import finalize 恢复时 machine ID 已被第三方修改");
       } else {
         const previousMatches = pending.previousPresent ? currentHash === pending.previousHash : currentHash === undefined;
         if (!previousMatches && currentHash !== pending.targetHash) throw new Error("import rollback 恢复时目标 config 已被第三方修改");
@@ -1986,6 +1988,11 @@ export function createConfigStore(machineId: string, env: Record<string, string 
             else { await unlink(configPath); await syncConfigDir(); }
             await restoreMachinePrevious(rollbackBundle.record, rollbackBundle.previousMachine);
           } finally { rollbackBundle.previous?.fill(0); rollbackBundle.previousMachine?.fill(0); }
+        } else {
+          const machineHash = await readMachineHash();
+          const previousMachineMatches = pending.machinePreviousPresent ? machineHash === pending.machinePreviousHash : machineHash === undefined;
+          if (!previousMachineMatches) throw new Error("import rollback 恢复时 machine ID 已被第三方修改");
+          await restoreMachinePrevious(pending, undefined);
         }
       }
       await cleanupImportBundle(pending.backupId, pending);
@@ -2002,17 +2009,19 @@ export function createConfigStore(machineId: string, env: Record<string, string 
       const currentHash = current && sha256(current);
       current?.fill(0);
       if (currentHash === pending.targetHash) {
+        await ensureMachineTarget(pending);
         await removeIfExists(importPendingPath);
         await syncConfigDir();
         return;
       }
       if ((pending.previousPresent && currentHash === pending.previousHash) || (!pending.previousPresent && currentHash === undefined)) {
+        await restoreMachinePrevious(bundle.record, bundle.previousMachine);
         await removeIfExists(importPendingPath);
         await removeImportBundle(pending.backupId);
         return;
       }
       throw new Error("import 恢复时目标 config 已被第三方修改");
-    } finally { bundle.previous?.fill(0); }
+    } finally { bundle.previous?.fill(0); bundle.previousMachine?.fill(0); }
   };
   const recoverImport = async (): Promise<void> => {
     if (!await guardConfigDir(true)) return;
@@ -2340,8 +2349,19 @@ export function createConfigStore(machineId: string, env: Record<string, string 
             try { await lstat(machineIdPath); throw new Error("machine ID 文件在 import mutation 前被创建"); }
             catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
           }
-          await writeAtomicBytes(configPath, canonical);
-          await writeAtomicBytes(machineIdPath, targetMachine);
+          let machinePublished = false;
+          try {
+            // 先发布 machine；若 auth 发布失败，立即按 receipt 恢复 machine，避免 auth 新而 machine 旧。
+            await writeAtomicBytes(machineIdPath, targetMachine);
+            machinePublished = true;
+            await writeAtomicBytes(configPath, canonical);
+          } catch (error) {
+            if (machinePublished) {
+              if (currentMachine) await writeAtomicBytes(machineIdPath, currentMachine);
+              else { await removeIfExists(machineIdPath); await syncConfigDir(); }
+            }
+            throw error;
+          }
           await dependencies.onImportPhase?.("after-replace");
           await removeIfExists(importPendingPath);
           await syncConfigDir();
@@ -2362,13 +2382,18 @@ export function createConfigStore(machineId: string, env: Record<string, string 
           const current = await readSecureBytes(configPath, "config 凭据路径");
           const currentHash = current && sha256(current);
           const currentSnapshot = current ? await snapshotImportFile(configPath, "config 凭据路径") : undefined;
-          current?.fill(0);
-          if (currentHash !== bundle.record.targetHash || !currentSnapshot) throw new Error("当前凭据已变化，拒绝 rollback");
+          const currentMachine = await readSecureBytes(machineIdPath, "machine ID 文件");
+          const currentMachineHash = currentMachine && sha256(currentMachine);
+          const currentMachineSnapshot = currentMachine ? await snapshotImportFile(machineIdPath, "machine ID 文件") : undefined;
+          current?.fill(0); currentMachine?.fill(0);
+          if (currentHash !== bundle.record.targetHash || !currentSnapshot || currentMachineHash !== bundle.record.targetMachineHash || !currentMachineSnapshot) throw new Error("当前凭据或 machine ID 已变化，拒绝 rollback");
           const cleanupRecord: ImportRecord = { ...bundle.record, action: "rollback-cleanup" };
           await writeAtomicBytes(importPendingPath, Buffer.from(`${JSON.stringify(cleanupRecord)}\n`, "utf8"));
           await dependencies.onImportPhase?.("after-rollback-pending");
           await dependencies.beforeImportTargetRecheck?.("rollback");
           await recheckImportTargetContent(currentSnapshot, bundle.record.targetHash);
+          if (!currentMachineSnapshot) throw new Error("machine ID 文件在 rollback mutation 前缺失");
+          await recheckMachineTargetContent(currentMachineSnapshot, bundle.record.targetMachineHash!);
           if (bundle.record.previousPresent) await writeAtomicBytes(configPath, bundle.previous!);
           else { await unlink(configPath); await syncConfigDir(); }
           await restoreMachinePrevious(bundle.record, bundle.previousMachine);
@@ -2398,10 +2423,15 @@ export function createConfigStore(machineId: string, env: Record<string, string 
           await dependencies.onImportPhase?.("after-finalize-pending");
           await dependencies.beforeImportTargetRecheck?.("finalize");
           await recheckImportTargetContent(currentSnapshot, bundle.record.targetHash);
+          const currentMachine = await readSecureBytes(machineIdPath, "machine ID 文件");
+          const currentMachineSnapshot = currentMachine ? await snapshotImportFile(machineIdPath, "machine ID 文件") : undefined;
+          currentMachine?.fill(0);
+          if (!currentMachineSnapshot) throw new Error("machine ID 文件在 finalize 前缺失");
+          await recheckMachineTargetContent(currentMachineSnapshot, bundle.record.targetMachineHash!);
           await cleanupImportBundle(backupId, cleanupRecord);
           await removeIfExists(importPendingPath);
           await syncConfigDir();
-        } finally { bundle.previous?.fill(0); }
+        } finally { bundle.previous?.fill(0); bundle.previousMachine?.fill(0); }
       });
     },
   };

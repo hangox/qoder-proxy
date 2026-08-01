@@ -17,15 +17,27 @@ function assertOwner(uid: number, label: string): void {
   if (owner !== undefined && uid !== owner) throw new Error(`${label} 所有者不是当前用户`);
 }
 
+export function validateMachineIdValue(value: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > MACHINE_ID_MAX_BYTES || value.includes("\n") || value.includes("\r") || value.trim() !== value) {
+    throw new Error("machine_id 必须是单行非空字符串");
+  }
+  return value;
+}
+
 function parseMachineId(bytes: Buffer): string {
   let raw: string;
   try { raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
   catch { throw new Error("machine_id 不是合法 UTF-8"); }
   const value = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
-  if (value.endsWith("\r") || value.length === 0 || value.includes("\n") || value.includes("\r") || value.trim() !== value) {
-    throw new Error("machine_id 必须是单行非空字符串");
-  }
-  return value;
+  return validateMachineIdValue(value);
+}
+
+export function resolveMachineIdSource(env: Record<string, string | undefined> = process.env): { direct?: string; file?: string } {
+  const direct = env.QODER_CN_MACHINE_ID;
+  const explicit = env.QODER_CN_MACHINE_ID_FILE;
+  if (direct !== undefined && explicit !== undefined) throw new Error("QODER_CN_MACHINE_ID 与 QODER_CN_MACHINE_ID_FILE 不能同时设置");
+  if (direct !== undefined) return { direct: validateMachineIdValue(direct) };
+  return { file: explicit === undefined ? join(proxyConfigDir(env), MACHINE_ID_FILE_NAME) : resolveMachineIdPath(env) };
 }
 
 export function proxyConfigDir(env: Record<string, string | undefined> = process.env): string {
