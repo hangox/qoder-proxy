@@ -14,17 +14,19 @@ afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
-async function createFakeProxy(): Promise<{ directory: string; executable: string; starts: string; routes: string }> {
+async function createFakeProxy(): Promise<{ directory: string; executable: string; starts: string; routes: string; machineSources: string }> {
   const directory = await mkdtemp(join(tmpdir(), "qoder-runtime-test-"));
   tempDirs.push(directory);
   const executable = join(directory, "qoder-proxy");
   const starts = join(directory, "starts");
   const routes = join(directory, "routes");
+  const machineSources = join(directory, "machine-sources");
   await writeFile(executable, `#!/usr/bin/env bun
 import { appendFileSync } from "node:fs";
 
 appendFileSync(process.env.QODER_RUNTIME_TEST_STARTS!, String(process.pid) + "\\n");
 appendFileSync(process.env.QODER_RUNTIME_TEST_ROUTES!, process.env.QODER_CN_INFER_MODEL_KEY + "\\n");
+appendFileSync(process.env.QODER_RUNTIME_TEST_MACHINE_SOURCES!, JSON.stringify({ direct: typeof process.env.QODER_CN_MACHINE_ID === "string", file: typeof process.env.QODER_CN_MACHINE_ID_FILE === "string" }) + "\\n");
 const port = Number(process.env.PORT);
 const token = process.env.QODER_PROXY_API_KEY!;
 const server = Bun.serve({
@@ -40,7 +42,8 @@ process.on("SIGTERM", () => { server.stop(); process.exit(0); });
 `, { mode: 0o700 });
   await writeFile(starts, "");
   await writeFile(routes, "");
-  return { directory, executable, starts, routes };
+  await writeFile(machineSources, "");
+  return { directory, executable, starts, routes, machineSources };
 }
 
 async function requestStatus(url: string, token: string): Promise<number> {
@@ -55,9 +58,10 @@ async function requestStatus(url: string, token: string): Promise<number> {
   });
 }
 
-function envFor(fake: { executable: string; starts: string; routes: string; directory: string }, socket: string, machineId: string) {
+function envFor(fake: { executable: string; starts: string; routes: string; machineSources: string; directory: string }, socket: string, machineId: string) {
   return {
     PATH: `${fake.directory}:${process.env.PATH || "/usr/bin:/bin"}`,
+    QODER_RUNTIME_TEST_MACHINE_SOURCES: fake.machineSources,
     QODER_PROXY_BIN: fake.executable,
     QODER_RUNTIME_TEST_STARTS: fake.starts,
     QODER_RUNTIME_TEST_ROUTES: fake.routes,
@@ -76,6 +80,36 @@ describe("Qoder runtime machine source", () => {
 });
 
 describe("Qoder runtime manager lease lifecycle", () => {
+  it("acquires direct-only machine ID and passes no file override to the child", async () => {
+    const fake = await createFakeProxy();
+    const socket = join(fake.directory, "runtime-direct.sock");
+    const manager = new QoderRuntimeManager({
+      ...envFor(fake, socket, join(fake.directory, "unused-machine-id")),
+      QODER_CN_MACHINE_ID: "direct-machine",
+      QODER_CN_MACHINE_ID_FILE: undefined,
+      QODER_PROXY_CONFIG_DIR: join(fake.directory, "missing-config"),
+    });
+    managers.push(manager);
+    await manager.listen();
+    const lease = await manager.acquire("run-direct-only", process.pid);
+    expect(await requestStatus(`${lease.baseUrl}/internal/quota`, lease.token)).toBe(200);
+    manager.release("run-direct-only", process.pid, lease.leaseId);
+    expect(JSON.parse((await readFile(fake.machineSources, "utf8")).trim())).toEqual({ direct: true, file: false });
+  });
+
+  it("rejects direct plus file machine source during acquire before starting a child", async () => {
+    const fake = await createFakeProxy();
+    const manager = new QoderRuntimeManager({
+      ...envFor(fake, join(fake.directory, "runtime-conflict.sock"), join(fake.directory, "machine-id")),
+      QODER_CN_MACHINE_ID: "direct-machine",
+      QODER_CN_MACHINE_ID_FILE: join(fake.directory, "machine-id"),
+    });
+    managers.push(manager);
+    await manager.listen();
+    await expect(manager.acquire("run-direct-conflict", process.pid)).rejects.toThrow(/不能同时/);
+    expect(await readFile(fake.starts, "utf8")).toBe("");
+  });
+
   it("uses the proxy-owned machine ID after an imported session clears the file override", async () => {
     const fake = await createFakeProxy();
     const configDir = join(fake.directory, "config");
