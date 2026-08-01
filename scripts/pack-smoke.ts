@@ -1,7 +1,7 @@
 // 本地 tarball 黑盒：打包、临时安装并从 PATH 执行 CLI；不会发布到 Registry。
 
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,6 +42,20 @@ try {
   if (!installedHook.includes("qoder-statusline-runtime.ts") || !installedHelper.includes("runtime") || !installedHelper.includes("status")) throw new Error("installer 未接入 managed statusline helper");
   const secondInstall = run(installer, [], project, { QODER_STATUSLINE_RUNTIME_TARGET: helper, QODER_STATUSLINE_HOOK_TARGET: hook });
   if (secondInstall.status !== 0) throw new Error(secondInstall.stderr || "installer 幂等 smoke failed");
+  const hookBeforeSymlink = await readFile(hook, "utf8");
+  const helperAlias = join(temp, "helper-alias.ts");
+  await writeFile(helperAlias, installedHelper, { mode: 0o600 });
+  const symlinkInstall = run(installer, [], project, { QODER_STATUSLINE_RUNTIME_TARGET: helperAlias, QODER_STATUSLINE_HOOK_TARGET: hook });
+  if (symlinkInstall.status === 0 || (await readFile(hook, "utf8")) !== hookBeforeSymlink) throw new Error("installer 应拒绝跨路径 helper 且不修改 hook");
+  const directoryTarget = join(temp, "helper-directory");
+  await mkdir(directoryTarget, { mode: 0o700 });
+  const directoryInstall = run(installer, [], project, { QODER_STATUSLINE_RUNTIME_TARGET: directoryTarget, QODER_STATUSLINE_HOOK_TARGET: hook });
+  if (directoryInstall.status === 0 || (await readFile(hook, "utf8")) !== hookBeforeSymlink) throw new Error("installer 应拒绝目录 helper 且不修改 hook");
+  const symlinkHook = join(temp, "statusline-link.ts");
+  await writeFile(symlinkHook + ".target", hookBeforeSymlink, { mode: 0o700 });
+  await symlink(`${symlinkHook}.target`, symlinkHook);
+  const symlinkHookInstall = run(installer, [], project, { QODER_STATUSLINE_RUNTIME_TARGET: helper, QODER_STATUSLINE_HOOK_TARGET: symlinkHook });
+  if (symlinkHookInstall.status === 0) throw new Error("installer 应拒绝缺少 regular hook target");
   const invocation = run(executable, ["unknown-command"], project);
   if (invocation.status === 0) throw new Error("未知命令应 fail-closed");
   const installedPackage = JSON.parse(await readFile(join(project, "node_modules", "@hangox", "qoder-proxy", "package.json"), "utf8")) as { name?: string };
