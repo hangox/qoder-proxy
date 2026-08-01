@@ -34,7 +34,7 @@ try {
   await mkdir(hookDir, { mode: 0o755 });
   const hook = join(hookDir, "statusline.ts");
   const helper = join(hookDir, "qoder-statusline-runtime.ts");
-  await writeFile(hook, "#!/usr/bin/env bun\nconsole.log('legacy');\n", { mode: 0o700 });
+  await writeFile(hook, "#!/usr/bin/env bun\nconsole.log('legacy');\n", { mode: 0o644 });
   const installSmoke = run(installer, [], project);
   if (installSmoke.status === 0) throw new Error("缺少显式 installer target 应 fail-closed");
   const installWithTargets = run(installer, [], project, { QODER_STATUSLINE_RUNTIME_TARGET: helper, QODER_STATUSLINE_HOOK_TARGET: hook });

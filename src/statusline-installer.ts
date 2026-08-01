@@ -8,7 +8,7 @@ const helperSource = join(packageDir, "qoder-statusline-runtime.js");
 const helperTarget = process.env.QODER_STATUSLINE_RUNTIME_TARGET;
 const hookTarget = process.env.QODER_STATUSLINE_HOOK_TARGET;
 if (!helperTarget || !hookTarget) throw new Error("必须显式提供 QODER_STATUSLINE_RUNTIME_TARGET 与 QODER_STATUSLINE_HOOK_TARGET");
-function secureTarget(path: string, allowMode: number): void {
+function secureTarget(path: string): void {
   const parent = dirname(path);
   if (existsSync(parent)) {
     const parentStat = lstatSync(parent);
@@ -20,14 +20,13 @@ function secureTarget(path: string, allowMode: number): void {
   const stat = lstatSync(path);
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`installer 目标必须是普通文件：${path}`);
   if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error(`installer 目标所有者不匹配：${path}`);
-  if ((stat.mode & 0o077) !== 0) throw new Error(`installer 目标权限不安全：${path}`);
-  if ((stat.mode & 0o777) !== allowMode) throw new Error(`installer 目标权限不符合契约：${path}`);
+  if ((stat.mode & 0o022) !== 0) throw new Error(`installer 目标权限不安全：${path}`);
 }
 if (!existsSync(helperSource) || !lstatSync(helperSource).isFile() || lstatSync(helperSource).isSymbolicLink()) throw new Error("安装包缺少 qoder statusline helper");
 if (!existsSync(hookTarget)) throw new Error("statusline.ts 目标不存在，拒绝修改");
-secureTarget(hookTarget, statSync(hookTarget).mode & 0o777);
+secureTarget(hookTarget);
 const expectedHelper = join(dirname(hookTarget), "qoder-statusline-runtime.ts");
-if (existsSync(helperTarget)) secureTarget(helperTarget, 0o600);
+if (existsSync(helperTarget)) secureTarget(helperTarget);
 if (resolve(helperTarget) !== resolve(expectedHelper)) throw new Error("helper 必须安装到 statusline.ts 同目录固定路径");
 
 const importLine = 'import { readQoderManagedLeaseStatus, type QoderManagedLease } from "./qoder-statusline-runtime.ts";';
