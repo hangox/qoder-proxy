@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+*.pid
+coverage/
+.env
+.env.*
+# 凭据永不入库
+**/auth-cn.json
+**/auth-*.json
+**/auth-cn.import.pending
+**/.auth-cn.import.*/
+# 临时捕获文件
+/tmp/qoder-*
