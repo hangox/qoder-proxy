@@ -13,15 +13,17 @@ afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
-async function createFakeProxy(): Promise<{ directory: string; executable: string; starts: string }> {
+async function createFakeProxy(): Promise<{ directory: string; executable: string; starts: string; routes: string }> {
   const directory = await mkdtemp(join(tmpdir(), "qoder-runtime-test-"));
   tempDirs.push(directory);
   const executable = join(directory, "qoder-proxy");
   const starts = join(directory, "starts");
+  const routes = join(directory, "routes");
   await writeFile(executable, `#!/usr/bin/env bun
 import { appendFileSync } from "node:fs";
 
 appendFileSync(process.env.QODER_RUNTIME_TEST_STARTS!, String(process.pid) + "\\n");
+appendFileSync(process.env.QODER_RUNTIME_TEST_ROUTES!, process.env.QODER_CN_INFER_MODEL_KEY + "\\n");
 const port = Number(process.env.PORT);
 const token = process.env.QODER_PROXY_API_KEY!;
 const server = Bun.serve({
@@ -36,7 +38,8 @@ const server = Bun.serve({
 process.on("SIGTERM", () => { server.stop(); process.exit(0); });
 `, { mode: 0o700 });
   await writeFile(starts, "");
-  return { directory, executable, starts };
+  await writeFile(routes, "");
+  return { directory, executable, starts, routes };
 }
 
 async function requestStatus(url: string, token: string): Promise<number> {
@@ -51,11 +54,12 @@ async function requestStatus(url: string, token: string): Promise<number> {
   });
 }
 
-function envFor(fake: { executable: string; starts: string; directory: string }, socket: string, machineId: string) {
+function envFor(fake: { executable: string; starts: string; routes: string; directory: string }, socket: string, machineId: string) {
   return {
     PATH: `${fake.directory}:${process.env.PATH || "/usr/bin:/bin"}`,
     QODER_PROXY_BIN: fake.executable,
     QODER_RUNTIME_TEST_STARTS: fake.starts,
+    QODER_RUNTIME_TEST_ROUTES: fake.routes,
     QODER_PROXY_RUNTIME_SOCKET: socket,
     QODER_CN_MACHINE_ID_FILE: machineId,
     HOME: fake.directory,
@@ -134,6 +138,22 @@ describe("Qoder runtime manager lease lifecycle", () => {
     manager.release("run-status", process.pid, lease.leaseId);
     await runRuntimeCommand(["status", "run-status", String(process.pid), lease.leaseId], envFor(fake, socket, machineId), io);
     expect(JSON.parse(outputs.pop()!)).toMatchObject({ active: false, runId: "run-status", ownerPid: process.pid, leaseId: lease.leaseId, socketPath: socket });
+  });
+
+  it("routes opus sonnet and haiku through one tier registry", async () => {
+    const fake = await createFakeProxy();
+    const machineId = join(fake.directory, "machine_id");
+    await writeFile(machineId, "machine-test\n", { mode: 0o600 });
+    const manager = new QoderRuntimeManager(envFor(fake, join(fake.directory, "runtime.sock"), machineId));
+    managers.push(manager);
+    await manager.listen();
+    for (const tier of ["opus", "sonnet", "haiku"] as const) {
+      const lease = await manager.acquire(`tier-${tier}`, process.pid, tier);
+      expect(lease.tier).toBe(tier);
+      expect(lease.routingKey).toBe(({ opus: "qmodel_preview", sonnet: "qmodel_latest", haiku: "q36fmodel" } as const)[tier]);
+      manager.release(`tier-${tier}`, process.pid, lease.leaseId);
+    }
+    expect((await readFile(fake.routes, "utf8")).replace(/\s+/g, " ").trim()).toBe("qmodel_preview qmodel_latest q36fmodel");
   });
 
   it("uses distinct credentials per run and rejects cross-run keys", async () => {
