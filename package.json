@@ -4,6 +4,14 @@
   "type": "module",
   "description": "Anthropic Messages → Qoder 中国站 legacy 代理（Gate 1 Walking Skeleton）",
   "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hangox/qoder-proxy.git"
+  },
+  "homepage": "https://github.com/hangox/qoder-proxy#readme",
+  "bugs": {
+    "url": "https://github.com/hangox/qoder-proxy/issues"
+  },
   "bin": {
     "qoder-proxy": "dist/qoder-proxy.js",
     "qoder-statusline-install": "dist/install-qoder-statusline.js"

@@ -1,0 +1,67 @@
+name: Publish package
+
+on:
+  release:
+    types: [published]
+
+# 按发布 tag 串行执行，避免同一 tag 的发布任务并发运行。
+concurrency:
+  group: publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # 检出 Release 对应的提交，确保校验和发布内容一致。
+      - name: 检出源码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      # 使用项目锁定的 Bun 版本安装依赖。
+      - name: 设置 Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: 安装依赖
+        run: bun install --frozen-lockfile
+
+      # Node 24 满足 npm Trusted Publishing 的运行时要求。
+      - name: 设置 Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.15.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: 安装 npm
+        run: npm install --global npm@12.0.2
+
+      - name: 校验 Release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          expected_tag="v$(node -p "require('./package.json').version")"
+          if [ "$RELEASE_TAG" != "$expected_tag" ]; then
+            echo "Release tag $RELEASE_TAG does not match package version tag $expected_tag" >&2
+            exit 1
+          fi
+
+      - name: 类型检查
+        run: bun run typecheck
+
+      - name: 运行测试
+        run: bun test --max-concurrency=1
+
+      - name: 验证打包产物
+        run: bun run test:pack
+
+      # npm Trusted Publishing 使用 GitHub OIDC，不配置 NODE_AUTH_TOKEN 或 NPM_TOKEN。
+      - name: 发布 npm 包
+        run: npm publish --access public --provenance
