@@ -33,7 +33,7 @@ const RUNTIME_LOG_MAX_BYTES = 256 * 1024;
 const RUNTIME_LOG_ROTATIONS = 3;
 const DEFAULT_REAPER_MS = 500;
 function runtimeLogPath(env: RuntimeEnv): string { return join(runtimeDirectory(env), "qoder-proxy.stderr.log"); }
-function appendRuntimeStderr(env: RuntimeEnv, chunk: Buffer | string, secret?: string): void {
+function appendRuntimeStderr(env: RuntimeEnv, chunk: Buffer | string): void {
   const path = runtimeLogPath(env);
   try {
     const directory = runtimeDirectory(env);
@@ -41,9 +41,7 @@ function appendRuntimeStderr(env: RuntimeEnv, chunk: Buffer | string, secret?: s
     chmodSync(directory, 0o700);
     const raw = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
     if (raw.length === 0) return;
-    const sanitized = secret ? raw.toString("utf8").split(secret).join("[redacted]") : raw.toString("utf8");
-    const safe = Buffer.from(sanitized, "utf8");
-    const text = safe.length > RUNTIME_LOG_MAX_BYTES ? safe.subarray(safe.length - RUNTIME_LOG_MAX_BYTES) : safe;
+    const text = raw.length > RUNTIME_LOG_MAX_BYTES ? raw.subarray(raw.length - RUNTIME_LOG_MAX_BYTES) : raw;
     if (existsSync(path) && statSync(path).size + text.length > RUNTIME_LOG_MAX_BYTES) {
       for (let index = RUNTIME_LOG_ROTATIONS - 1; index >= 1; index--) {
         const source = `${path}.${index}`;
@@ -55,6 +53,27 @@ function appendRuntimeStderr(env: RuntimeEnv, chunk: Buffer | string, secret?: s
     appendFileSync(path, text, { mode: 0o600 });
     chmodSync(path, 0o600);
   } catch {}
+}
+function createRuntimeStderrWriter(env: RuntimeEnv, secret: string): { write(chunk: Buffer | string): void; flush(): void } {
+  let carry = "";
+  let flushed = false;
+  const write = (chunk: Buffer | string): void => {
+    if (flushed) return;
+    const combined = carry + (Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk);
+    const keep = Math.max(0, secret.length - 1);
+    const found = combined.includes(secret);
+    const safe = found ? combined.split(secret).join("[redacted]") : combined;
+    const cutoff = Math.max(0, safe.length - keep);
+    appendRuntimeStderr(env, safe.slice(0, cutoff));
+    carry = found ? safe.slice(cutoff) : combined.slice(cutoff);
+  };
+  const flush = (): void => {
+    if (flushed) return;
+    flushed = true;
+    appendRuntimeStderr(env, carry.split(secret).join("[redacted]"));
+    carry = "";
+  };
+  return { write, flush };
 }
 function reaperIntervalMs(env: RuntimeEnv): number {
   const parsed = Number(env.QODER_RUNTIME_REAPER_MS);
@@ -217,7 +236,9 @@ export class QoderRuntimeManager {
     childEnv.QODER_PROXY_STARTUP_ERROR_FILE = startupErrorPath;
     try { unlinkSync(startupErrorPath); } catch {}
     const child = spawn(command.command, command.args, { cwd: command.cwd, detached: false, stdio: ["ignore", "ignore", "pipe"], env: childEnv });
-    child.stderr?.on("data", (chunk: Buffer) => appendRuntimeStderr(this.env, chunk, token));
+    const stderrWriter = createRuntimeStderrWriter(this.env, token);
+    child.stderr?.on("data", (chunk: Buffer) => stderrWriter.write(chunk));
+    child.once("close", () => stderrWriter.flush());
     const lease: Lease = { runId, token, leaseId, tier, baseUrl: `http://127.0.0.1:${port}`, child, owners: new Set([ownerPid]), invalid: false }; this.leases.set(runId, lease);
     child.once("exit", () => {
       lease.invalid = true;

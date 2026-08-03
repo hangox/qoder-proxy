@@ -28,6 +28,14 @@ import { appendFileSync } from "node:fs";
 appendFileSync(process.env.QODER_RUNTIME_TEST_STARTS!, String(process.pid) + "\\n");
 appendFileSync(process.env.QODER_RUNTIME_TEST_ROUTES!, process.env.QODER_CN_INFER_MODEL_KEY + "\\n");
 appendFileSync(process.env.QODER_RUNTIME_TEST_MACHINE_SOURCES!, JSON.stringify({ direct: typeof process.env.QODER_CN_MACHINE_ID === "string", file: typeof process.env.QODER_CN_MACHINE_ID_FILE === "string" }) + "\\n");
+if (process.env.QODER_RUNTIME_TEST_SPLIT_STDERR === "1") {
+  const secret = process.env.QODER_PROXY_API_KEY!;
+  process.stderr.write(secret.slice(0, 17));
+  setTimeout(() => process.stderr.write(secret.slice(17) + "\\n"), 100);
+}
+if (process.env.QODER_RUNTIME_TEST_LARGE_STDERR === "1") {
+  process.stderr.write("x".repeat(300_000) + process.env.QODER_PROXY_API_KEY! + "\\n");
+}
 const port = Number(process.env.PORT);
 const token = process.env.QODER_PROXY_API_KEY!;
 const server = Bun.serve({
@@ -69,6 +77,8 @@ function envFor(fake: { executable: string; starts: string; routes: string; mach
   return {
     PATH: `${fake.directory}:${process.env.PATH || "/usr/bin:/bin"}`,
     QODER_RUNTIME_TEST_MACHINE_SOURCES: fake.machineSources,
+    QODER_RUNTIME_TEST_SPLIT_STDERR: "0",
+    QODER_RUNTIME_TEST_LARGE_STDERR: "0",
     QODER_PROXY_BIN: fake.executable,
     QODER_RUNTIME_TEST_STARTS: fake.starts,
     QODER_RUNTIME_TEST_ROUTES: fake.routes,
@@ -190,17 +200,24 @@ describe("Qoder runtime manager lease lifecycle", () => {
     const socket = join(fake.directory, "runtime-log.sock");
     const machineId = join(fake.directory, "machine-id");
     await writeFile(machineId, "machine-log\n", { mode: 0o600 });
-    const manager = new QoderRuntimeManager(envFor(fake, socket, machineId));
+    const manager = new QoderRuntimeManager({ ...envFor(fake, socket, machineId), QODER_RUNTIME_TEST_SPLIT_STDERR: "1", QODER_RUNTIME_TEST_LARGE_STDERR: "1" });
     managers.push(manager);
     await manager.listen();
     const lease = await manager.acquire("run-log", process.pid);
     const logPath = join(fake.directory, "qoder-proxy.stderr.log");
-    await writeFile(logPath, `${"x".repeat(300_000)}secret\n`, { mode: 0o600 });
-    await chmod(logPath, 0o600);
-    expect((await stat(logPath)).mode & 0o077).toBe(0);
-    expect((await readFile(logPath, "utf8")).length).toBeGreaterThan(0);
-    expect((await readFile(logPath, "utf8"))).not.toContain(lease.token);
+    await new Promise((resolve) => setTimeout(resolve, 150));
     manager.release("run-log", process.pid, lease.leaseId);
+    let diagnosticLog = "";
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try { diagnosticLog = await readFile(logPath, "utf8"); } catch { diagnosticLog = ""; }
+      if (diagnosticLog.includes("[redacted]")) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(diagnosticLog).toContain("[redacted]");
+    expect(diagnosticLog).not.toContain(lease.token);
+    expect((await stat(logPath)).mode & 0o077).toBe(0);
+    expect((await stat(logPath)).size).toBeLessThanOrEqual(262144);
+    expect(diagnosticLog.length).toBeGreaterThan(0);
   });
 
   it("publishes status JSON before and after release without the secret", async () => {
