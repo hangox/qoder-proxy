@@ -3,23 +3,33 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-type PackFile = { path?: unknown };
-type PackRecord = { files?: PackFile[] };
+type PackFile = { path: string };
+type PackRecord = { files: PackFile[] };
 
 function isPackRecord(value: unknown): value is PackRecord {
-  return typeof value === "object" && value !== null && Array.isArray((value as { files?: unknown }).files);
+  if (typeof value !== "object" || value === null) return false;
+  const files = (value as { files?: unknown }).files;
+  if (!Array.isArray(files) || files.length === 0) return false;
+  return files.every(
+    (file) =>
+      typeof file === "object" &&
+      file !== null &&
+      typeof (file as { path?: unknown }).path === "string" &&
+      (file as { path: string }).path.length > 0,
+  );
 }
 
-export function normalizePackResults(value: unknown): PackRecord[] {
+export function normalizePackResults(value: unknown): [PackRecord] {
   const candidates = Array.isArray(value)
     ? value
     : typeof value === "object" && value !== null
       ? Object.values(value)
       : null;
   if (candidates === null) throw new Error("npm pack JSON 格式无效：预期数组或包名映射对象");
-  const records = candidates.filter(isPackRecord);
-  if (records.length === 0) throw new Error("npm pack JSON 中没有有效文件记录");
-  return records;
+  if (candidates.length !== 1 || !isPackRecord(candidates[0])) {
+    throw new Error("npm pack JSON 必须恰好包含一个合法的非空 pack record");
+  }
+  return [candidates[0]];
 }
 
 export function verifyPackageFiles(paths: string[]): void {

@@ -16,9 +16,18 @@ describe("npm package verifier", () => {
     expect(normalizePackResults({ "@hangox/qoder-proxy": record })).toEqual([record]);
   });
 
-  it("拒绝无有效 pack 记录的 JSON", () => {
+  it("拒绝空记录、混入畸形记录、非字符串路径和多个有效记录", () => {
+    const record = { files: requiredFiles.map((path) => ({ path })) };
+    expect(() => normalizePackResults([])).toThrow("恰好包含一个合法");
+    expect(() => normalizePackResults([record, { files: [] }])).toThrow("恰好包含一个合法");
+    expect(() => normalizePackResults({ "@hangox/qoder-proxy": record, malformed: {} })).toThrow("恰好包含一个合法");
+    expect(() => normalizePackResults([{ files: [{ path: 42 }] }])).toThrow("恰好包含一个合法");
+    expect(() => normalizePackResults([record, record])).toThrow("恰好包含一个合法");
+  });
+
+  it("拒绝无效 pack JSON", () => {
     expect(() => normalizePackResults(null)).toThrow("npm pack JSON 格式无效");
-    expect(() => normalizePackResults({ "@hangox/qoder-proxy": { name: "@hangox/qoder-proxy" } })).toThrow("npm pack JSON 中没有有效文件记录");
+    expect(() => normalizePackResults({ "@hangox/qoder-proxy": { name: "@hangox/qoder-proxy" } })).toThrow("恰好包含一个合法");
   });
 
   it("保持五文件发布白名单与禁止路径校验", () => {

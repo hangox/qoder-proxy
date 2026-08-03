@@ -1,6 +1,6 @@
 {
   "name": "@hangox/qoder-proxy",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Anthropic Messages → Qoder 中国站 legacy 代理（Gate 1 Walking Skeleton）",
   "license": "UNLICENSED",
