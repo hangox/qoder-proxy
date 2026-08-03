@@ -3,8 +3,8 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-type PackFile = { path: string };
-type PackRecord = { files: PackFile[] };
+export type PackFile = { path: string };
+export type PackRecord = { files: PackFile[]; filename?: string };
 
 function isPackRecord(value: unknown): value is PackRecord {
   if (typeof value !== "object" || value === null) return false;
@@ -30,6 +30,21 @@ export function normalizePackResults(value: unknown): [PackRecord] {
     throw new Error("npm pack JSON 必须恰好包含一个合法的非空 pack record");
   }
   return [candidates[0]];
+}
+
+export function parsePackRecord(value: unknown): PackRecord {
+  const records = normalizePackResults(value);
+  const record = records[0];
+  if (!record) throw new Error("npm pack JSON 必须恰好包含一个合法的非空 pack record");
+  return record;
+}
+
+export function packFilename(record: PackRecord): string {
+  const filename = record.filename;
+  if (typeof filename !== "string" || filename.length === 0 || filename.includes("/") || filename.includes("\\") || filename === "." || filename === "..") {
+    throw new Error("npm pack JSON filename 必须是非空 basename");
+  }
+  return filename;
 }
 
 export function verifyPackageFiles(paths: string[]): void {
@@ -63,8 +78,8 @@ export function main(): void {
     process.stderr.write(result.stderr);
     process.exit(result.status ?? 1);
   }
-  const packs = normalizePackResults(JSON.parse(result.stdout));
-  const paths = packs[0]?.files?.map((file) => file.path).filter((path): path is string => typeof path === "string") ?? [];
+  const record = parsePackRecord(JSON.parse(result.stdout));
+  const paths = record.files.map((file) => file.path);
   verifyPackageFiles(paths);
   console.log(`npm package audit: pass (${paths.join(", ")})`);
 }

@@ -5,6 +5,7 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { packFilename, parsePackRecord } from "./verify-package.ts";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const temp = await mkdtemp(join(tmpdir(), "qoder-proxy-pack-"));
@@ -16,7 +17,7 @@ function run(command: string, args: string[], cwd: string, env?: Record<string, 
 try {
   const pack = run("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", temp], root);
   if (pack.status !== 0) throw new Error(pack.stderr);
-  const [{ filename }] = JSON.parse(pack.stdout) as Array<{ filename: string }>;
+  const filename = packFilename(parsePackRecord(JSON.parse(pack.stdout)));
   const tarball = join(temp, filename);
 
   const project = join(temp, "consumer");

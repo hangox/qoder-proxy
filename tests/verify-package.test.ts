@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizePackResults, verifyPackageFiles } from "../scripts/verify-package.ts";
+import { normalizePackResults, packFilename, parsePackRecord, verifyPackageFiles } from "../scripts/verify-package.ts";
 
 const requiredFiles = [
   "README.md",
@@ -11,18 +11,28 @@ const requiredFiles = [
 
 describe("npm package verifier", () => {
   it("兼容 npm 11 数组与 npm 12 包名映射 JSON", () => {
-    const record = { files: requiredFiles.map((path) => ({ path })) };
+    const record = { filename: "hangox-qoder-proxy-0.1.3.tgz", files: requiredFiles.map((path) => ({ path })) };
     expect(normalizePackResults([record])).toEqual([record]);
     expect(normalizePackResults({ "@hangox/qoder-proxy": record })).toEqual([record]);
   });
 
   it("拒绝空记录、混入畸形记录、非字符串路径和多个有效记录", () => {
-    const record = { files: requiredFiles.map((path) => ({ path })) };
+    const record = { filename: "hangox-qoder-proxy-0.1.3.tgz", files: requiredFiles.map((path) => ({ path })) };
     expect(() => normalizePackResults([])).toThrow("恰好包含一个合法");
     expect(() => normalizePackResults([record, { files: [] }])).toThrow("恰好包含一个合法");
     expect(() => normalizePackResults({ "@hangox/qoder-proxy": record, malformed: {} })).toThrow("恰好包含一个合法");
     expect(() => normalizePackResults([{ files: [{ path: 42 }] }])).toThrow("恰好包含一个合法");
     expect(() => normalizePackResults([record, record])).toThrow("恰好包含一个合法");
+  });
+
+  it("解析唯一记录并严格校验 tarball filename", () => {
+    const record = { filename: "hangox-qoder-proxy-0.1.3.tgz", files: requiredFiles.map((path) => ({ path })) };
+    expect(parsePackRecord({ "@hangox/qoder-proxy": record })).toEqual(record);
+    expect(packFilename(record)).toBe("hangox-qoder-proxy-0.1.3.tgz");
+    expect(() => packFilename({ ...record, filename: "" })).toThrow("filename");
+    expect(() => packFilename({ ...record, filename: "../escape.tgz" })).toThrow("filename");
+    expect(() => packFilename({ ...record, filename: "nested/file.tgz" })).toThrow("filename");
+    expect(() => packFilename({ ...record, filename: 42 as unknown as string })).toThrow("filename");
   });
 
   it("拒绝无效 pack JSON", () => {
