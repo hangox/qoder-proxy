@@ -86,15 +86,34 @@ describe("runtime readiness fail-fast", () => {
 });
 
 describe("model routing identity endpoint", () => {
-  it("rejects a present key whose display name drifts", async () => {
+  it("rejects a present registered key whose display name drifts", async () => {
     const session = { listModels: async () => ({ generation: 3, models: [{ key: "qmodel_latest", displayName: "Qwen3.7-Plus" }] }) } as unknown as SessionLike;
     const response = await createApp({ QODER_PROXY_API_KEY: "test-key", QODER_CN_INFER_MODEL_KEY: "qmodel_latest" }, session).request("/internal/model-routing", { headers: { authorization: "Bearer test-key" } });
     expect(response.status).toBe(404);
     expect(await response.json()).toMatchObject({ error: { message: "runtime routing model identity unavailable" } });
   });
+
+  it("accepts a present custom qmodel key without registry identity", async () => {
+    const session = { listModels: async () => ({ generation: 4, models: [{ key: "qmodel", displayName: "Qwen3.7-Plus" }] }) } as unknown as SessionLike;
+    const response = await createApp({ QODER_PROXY_API_KEY: "test-key", QODER_CN_INFER_MODEL_KEY: "qmodel" }, session).request("/internal/model-routing", { headers: { authorization: "Bearer test-key" } });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, routingKey: "qmodel", displayName: "Qwen3.7-Plus" });
+  });
 });
 
 describe("serve model preflight", () => {
+  it("accepts a present custom qmodel key without registry identity", async () => {
+    const root = await mkdtemp(join(tmpdir(), "qoder-cli-custom-")); roots.push(root);
+    let bound = false;
+    const session = { listModels: async (): Promise<ModelCatalogSnapshot> => ({ generation: 7, models: [{ key: "qmodel", displayName: "Qwen3.7-Plus" } as never] }) } as unknown as AuthSession;
+    const runtime = await runCli(["serve"], { QODER_PROXY_API_KEY: "test-key", QODER_CN_INFER_MODEL_KEY: "qmodel" }, undefined, {
+      preflight: async () => session,
+      bind: () => { bound = true; return { close() {} }; },
+    });
+    expect(bound).toBe(true);
+    runtime?.close();
+  });
+
   it.each([
     ["missing", new QoderModelUnavailableError("qmodel_38max"), { code: "model-unavailable", routingKey: "qmodel_38max" }],
     ["identity", new QoderModelUnavailableError("qmodel_38max", "identity-mismatch"), { code: "model-unavailable", routingKey: "qmodel_38max" }],

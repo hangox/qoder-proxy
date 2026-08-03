@@ -6,7 +6,7 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { dirname, join } from "node:path";
 import { request as httpRequest } from "node:http";
 import { readMachineIdFile, resolveMachineIdSource } from "./machine-id.ts";
-import { hasExpectedModelIdentity, QODER_TIER_REGISTRY, QoderModelCatalogUnavailableError, QoderModelUnavailableError, type QoderTier } from "./model-registry.ts";
+import { expectedModelForRoutingKey, hasExpectedModelIdentity, QODER_TIER_REGISTRY, QoderModelCatalogUnavailableError, QoderModelUnavailableError, type QoderTier } from "./model-registry.ts";
 export { QODER_TIER_REGISTRY } from "./model-registry.ts";
 export type { QoderTier } from "./model-registry.ts";
 
@@ -99,7 +99,8 @@ async function waitReady(baseUrl: string, token: string, child: ChildProcess, st
       if (routing.status === 200) {
         let body: { routingKey?: unknown; displayName?: unknown };
         try { body = JSON.parse(routing.body) as { routingKey?: unknown; displayName?: unknown }; } catch { throw new Error("model routing readiness 响应无效"); }
-        if (body.routingKey !== routingKey || typeof body.displayName !== "string" || !hasExpectedModelIdentity({ key: routingKey, displayName: body.displayName }, routingKey)) {
+        if (body.routingKey !== routingKey) throw new QoderModelUnavailableError(routingKey, "identity-mismatch");
+        if (expectedModelForRoutingKey(routingKey) !== undefined && (typeof body.displayName !== "string" || !hasExpectedModelIdentity({ key: routingKey, displayName: body.displayName }, routingKey))) {
           throw new QoderModelUnavailableError(routingKey, "identity-mismatch");
         }
         return;

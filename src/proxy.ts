@@ -10,7 +10,7 @@ import { convertAnthropicToCnBody, ConversionError, validateAnthropicRequestEnve
 import { emitAnthropicSseStream, collectAnthropicMessage } from "./sse.ts";
 import { AuthSession, CatalogUpstreamError, QuotaUpstreamError, StaleModelCatalogError, type ModelCatalogSnapshot, type QoderQuotaUsage, type SignedAttempt } from "./auth/session.ts";
 import { findModelById, ModelPaginationError, paginateModels, toAnthropicModelInfo, type QoderAssistantModel } from "./models.ts";
-import { hasExpectedModelIdentity } from "./model-registry.ts";
+import { expectedModelForRoutingKey, hasExpectedModelIdentity } from "./model-registry.ts";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const ANTHROPIC_VERSION = "2023-06-01";
@@ -245,7 +245,7 @@ export function createApp(env: Record<string, string | undefined> = process.env,
       if (!target) {
         return c.json(apiError("not_found_error", "runtime routing key unavailable"), 404);
       }
-      if (!hasExpectedModelIdentity(target, routingKey)) {
+      if (expectedModelForRoutingKey(routingKey) !== undefined && !hasExpectedModelIdentity(target, routingKey)) {
         return c.json(apiError("not_found_error", "runtime routing model identity unavailable"), 404);
       }
       return c.json({ ok: true, routingKey, displayName: target.displayName, generation: snapshot.generation });
