@@ -102,7 +102,7 @@ describe("Qoder runtime stderr secret redaction", () => {
     const chunks = ["a", "b", "aaba", "xx", "aba", "a"];
     const output: string[] = [];
     const redactor = createStreamingSecretRedactor(secret, (chunk) => output.push(chunk));
-    for (const chunk of chunks) redactor.write(chunk);
+    for (const chunk of chunks) redactor.write(Buffer.from(chunk));
     redactor.flush();
     const value = output.join("");
     expect(value).not.toContain(secret);
@@ -110,12 +110,23 @@ describe("Qoder runtime stderr secret redaction", () => {
     expect(value).toContain("xx");
   });
 
+  it("never emits a marker containing any case variant of short secrets", () => {
+    for (const secret of ["[redacted]", "redacted", "edact", "a", "A"]) {
+      const output: string[] = [];
+      const redactor = createStreamingSecretRedactor(secret, (chunk) => output.push(chunk));
+      redactor.write(Buffer.from(`prefix-${secret}-suffix`));
+      redactor.flush();
+      const value = output.join("");
+      expect(value.toLowerCase()).not.toContain(secret.toLowerCase());
+    }
+  });
+
   it("keeps an arbitrary random-like partition safe through flush", () => {
     const secret = "token-1234567890";
     const payload = `prefix-${secret}-middle-${secret}-${secret}-suffix`;
     const output: string[] = [];
     const redactor = createStreamingSecretRedactor(secret, (chunk) => output.push(chunk));
-    for (let index = 0; index < payload.length; index += 3) redactor.write(payload.slice(index, index + 3));
+    for (let index = 0; index < payload.length; index += 3) redactor.write(Buffer.from(payload.slice(index, index + 3)));
     redactor.flush();
     const value = output.join("");
     expect(value).not.toContain(secret);

@@ -1,13 +1,14 @@
 import { StringDecoder } from "node:string_decoder";
 
 export type StreamingSecretRedactor = {
-  write(chunk: Buffer | string): void;
+  write(chunk: Buffer): void;
   flush(): void;
 };
 
 export function createStreamingSecretRedactor(secret: string, sink: (chunk: string) => void): StreamingSecretRedactor {
   if (secret.length === 0) throw new Error("脱敏 secret 不能为空");
-  const replacement = secret.includes("[redacted]") || secret.includes("[REDACTED]") ? "" : "[redacted]";
+  const marker = "[redacted]";
+  const replacement = marker.toLowerCase().includes(secret.toLowerCase()) ? "" : marker;
   const decoder = new StringDecoder("utf8");
   let carry = "";
   let flushed = false;
@@ -21,9 +22,9 @@ export function createStreamingSecretRedactor(secret: string, sink: (chunk: stri
     carry = safe.slice(cutoff);
   };
 
-  const write = (chunk: Buffer | string): void => {
+  const write = (chunk: Buffer): void => {
     if (flushed) return;
-    processText(Buffer.isBuffer(chunk) ? decoder.write(chunk) : chunk);
+    processText(decoder.write(chunk));
   };
 
   const flush = (): void => {
