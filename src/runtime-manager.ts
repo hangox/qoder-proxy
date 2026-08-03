@@ -6,6 +6,7 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { dirname, join } from "node:path";
 import { request as httpRequest } from "node:http";
 import { readMachineIdFile, resolveMachineIdSource } from "./machine-id.ts";
+import { createStreamingSecretRedactor } from "./secret-redactor.ts";
 import { expectedModelForRoutingKey, hasExpectedModelIdentity, QODER_TIER_REGISTRY, QoderModelCatalogUnavailableError, QoderModelUnavailableError, type QoderTier } from "./model-registry.ts";
 export { QODER_TIER_REGISTRY } from "./model-registry.ts";
 export type { QoderTier } from "./model-registry.ts";
@@ -53,28 +54,6 @@ function appendRuntimeStderr(env: RuntimeEnv, chunk: Buffer | string): void {
     appendFileSync(path, text, { mode: 0o600 });
     chmodSync(path, 0o600);
   } catch {}
-}
-export function createStreamingSecretRedactor(secret: string, sink: (chunk: string) => void): { write(chunk: Buffer | string): void; flush(): void } {
-  if (secret.length === 0) throw new Error("脱敏 secret 不能为空");
-  const replacement = secret.includes("[redacted]") || secret.includes("[REDACTED]") ? "" : "[redacted]";
-  let carry = "";
-  let flushed = false;
-  const write = (chunk: Buffer | string): void => {
-    if (flushed) return;
-    const combined = carry + (Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk);
-    const keep = secret.length - 1;
-    const safe = combined.split(secret).join(replacement);
-    const cutoff = Math.max(0, safe.length - keep);
-    sink(safe.slice(0, cutoff));
-    carry = safe.length > cutoff ? safe.slice(cutoff) : "";
-  };
-  const flush = (): void => {
-    if (flushed) return;
-    flushed = true;
-    sink(carry.split(secret).join(replacement));
-    carry = "";
-  };
-  return { write, flush };
 }
 function createRuntimeStderrWriter(env: RuntimeEnv, secret: string): { write(chunk: Buffer | string): void; flush(): void } {
   return createStreamingSecretRedactor(secret, (chunk) => appendRuntimeStderr(env, chunk));

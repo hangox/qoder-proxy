@@ -4,7 +4,8 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
-import { createStreamingSecretRedactor, QoderRuntimeManager, runRuntimeCommand } from "../src/runtime-manager.ts";
+import { QoderRuntimeManager, runRuntimeCommand } from "../src/runtime-manager.ts";
+import { createStreamingSecretRedactor } from "../src/secret-redactor.ts";
 import { QODER_TIER_REGISTRY } from "../src/model-registry.ts";
 import { resolveMachineIdSource } from "../src/machine-id.ts";
 
