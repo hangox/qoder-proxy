@@ -43,7 +43,7 @@
 
 公开 `id` 是官方 Qoder routing key，例如当前已核实的：
 
-- `qmodel_preview` → `Qwen3.8-Max-Preview`
+- `qmodel_38max` → `Qwen3.8-Max`
 
 目录没有提供独立 provider/canonical ID，因此代理不会构造 `qwen3.8-max-preview` 等猜测 ID。Claude Code 或其他客户端 UI 显示的模型层级标签不等同于 Qoder routing key；以 `/v1/models` 与实际解析结果为准。
 

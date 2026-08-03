@@ -3,13 +3,14 @@
 import { serve } from "@hono/node-server";
 import type { ServerType } from "@hono/node-server";
 import { createApp } from "./proxy.ts";
-import { AuthSession, PendingPreflightPersistenceError, type CredentialStore } from "./auth/session.ts";
+import { AuthSession, CatalogUpstreamError, PendingPreflightPersistenceError, type CredentialStore } from "./auth/session.ts";
 import { DEFAULT_QODER_SOURCE_DIR, importStore, prepareQoderImport, type ImportDependencies, type PreparedQoderImport } from "./auth/import.ts";
 import { readMachineIdFile, resolveMachineIdPath } from "./machine-id.ts";
 import { logger } from "./logger.ts";
 import { createRoutingAttestation } from "./attestation.ts";
 import type { RoutingAttestation } from "./attestation.ts";
 import { runRuntimeCommand } from "./runtime-manager.ts";
+import { QoderModelUnavailableError } from "./model-registry.ts";
 
 const DEFAULT_PREFLIGHT_RETRY_MS = 1_000;
 const DEFAULT_SHUTDOWN_DRAIN_MS = 5_000;
@@ -161,6 +162,17 @@ export async function runCli(
     try {
       signal?.throwIfAborted();
       const session = await preflightBeforeBind(resolvedEnv, dependencies.preflight ?? AuthSession.preflight, signal);
+      const routingKey = resolvedEnv.QODER_CN_INFER_MODEL_KEY;
+      if (routingKey !== undefined && routingKey.length > 0) {
+        try {
+          const snapshot = await session.listModels(signal);
+          if (!snapshot.models.some((model) => model.key === routingKey)) throw new QoderModelUnavailableError(routingKey);
+        } catch (error) {
+          if (error instanceof QoderModelUnavailableError) throw error;
+          if (error instanceof CatalogUpstreamError) throw error;
+          throw new Error("Qoder model catalog unavailable", { cause: error });
+        }
+      }
       // attestation sink 在 preflight 之前建立，只有 preflight 成功后才计数，确保同一 run 的 record 能证明启动边界。
       routingAttestation?.recordPreflight();
       signal?.throwIfAborted();

@@ -6,15 +6,12 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { dirname, join } from "node:path";
 import { request as httpRequest } from "node:http";
 import { readMachineIdFile, resolveMachineIdSource } from "./machine-id.ts";
+import { QODER_TIER_REGISTRY, QoderModelCatalogUnavailableError, QoderModelUnavailableError, type QoderTier } from "./model-registry.ts";
+export { QODER_TIER_REGISTRY } from "./model-registry.ts";
+export type { QoderTier } from "./model-registry.ts";
 
 export type RuntimeEnv = Record<string, string | undefined>;
 export type RuntimeIo = { stdout(value: string): void; stderr(value: string): void };
-export const QODER_TIER_REGISTRY = {
-  opus: { claudeModel: "qmodel_preview[1m]", routingKey: "qmodel_preview" },
-  sonnet: { claudeModel: "qmodel_latest[1m]", routingKey: "qmodel_latest" },
-  haiku: { claudeModel: "q36fmodel[1m]", routingKey: "q36fmodel" },
-} as const;
-export type QoderTier = keyof typeof QODER_TIER_REGISTRY;
 type RuntimeRequest = { op: "acquire" | "release" | "shutdown" | "ping" | "status"; runId?: string; ownerPid?: number; leaseId?: string; tier?: string };
 type RuntimeResponse = { ok: true; active?: boolean; runId?: string; ownerPid?: number; leaseId?: string; baseUrl?: string; socketPath?: string; token?: string; released?: boolean; tier?: QoderTier; routingKey?: string } | { ok: false; error: string };
 type Lease = { runId: string; token: string; leaseId: string; tier: QoderTier; baseUrl: string; child: ChildProcess; owners: Set<number>; invalid: boolean };
@@ -82,7 +79,16 @@ async function requestStatus(url: string, token: string): Promise<{ status: numb
 async function waitReady(baseUrl: string, token: string): Promise<void> {
   const deadline = Date.now() + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    try { if ((await requestStatus(`${baseUrl}/internal/quota`, token)).status === 200) return; } catch { /* readiness retry */ }
+    try {
+      if ((await requestStatus(`${baseUrl}/internal/quota`, token)).status !== 200) throw new Error("quota readiness failed");
+      const routing = await requestStatus(`${baseUrl}/internal/model-routing`, token);
+      if (routing.status === 200) return;
+      if (routing.status === 404) throw new QoderModelUnavailableError("runtime routing key");
+      if (routing.status === 500 || routing.status === 502) throw new QoderModelCatalogUnavailableError();
+      throw new Error(`model routing readiness failed: ${routing.status}`);
+    } catch (error) {
+      if (error instanceof QoderModelUnavailableError || error instanceof QoderModelCatalogUnavailableError) throw error;
+    }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error("qoder-proxy readiness 超时");

@@ -3,8 +3,8 @@ import { convertAnthropicToCnBody, ConversionError, MAX_CN_MAX_TOKENS } from "..
 import type { QoderAssistantModel } from "../src/models.ts";
 
 const MODEL: QoderAssistantModel = {
-  key: "qmodel_preview",
-  displayName: "Qwen3.8-Max-Preview",
+  key: "qmodel_38max",
+  displayName: "Qwen3.8-Max",
   isDefault: false,
   isVision: true,
   isReasoning: true,
@@ -157,7 +157,7 @@ describe("convertAnthropicToCnBody", () => {
     });
     expect(provenance.requestedModel).toBe("claude-opus-4-20250514");
     expect(JSON.stringify(body)).not.toContain("claude-opus-4-20250514");
-    expect(body.model_config).toMatchObject({ key: "qmodel_preview", max_input_tokens: 180000 });
+    expect(body.model_config).toMatchObject({ key: "qmodel_38max", max_input_tokens: 180000 });
   });
 
   it.each(["", "   "])("rejects an empty model value: %j", (model) => {

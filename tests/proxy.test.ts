@@ -10,7 +10,7 @@ import type { QoderAssistantModel } from "../src/models.ts";
 const ENV = { QODER_PROXY_API_KEY: "test-api-key" };
 const MODELS: QoderAssistantModel[] = [
   { key: "auto", displayName: "Auto", isDefault: true, isVision: false, isReasoning: false, maxInputTokens: 200000, maxOutputTokens: null, createdAt: "1970-01-01T00:00:00.000Z", format: "openai", source: "system" },
-  { key: "qmodel_preview", displayName: "Qwen3.8-Max-Preview", isDefault: false, isVision: false, isReasoning: true, maxInputTokens: 200000, maxOutputTokens: null, createdAt: "1970-01-01T00:00:00.000Z", format: "openai", source: "system" },
+  { key: "qmodel_38max", displayName: "Qwen3.8-Max", isDefault: false, isVision: false, isReasoning: true, maxInputTokens: 200000, maxOutputTokens: null, createdAt: "1970-01-01T00:00:00.000Z", format: "openai", source: "system" },
 ];
 const HEADERS = { "content-type": "application/json", "x-api-key": ENV.QODER_PROXY_API_KEY };
 const MODEL_HEADERS = { "x-api-key": ENV.QODER_PROXY_API_KEY, "anthropic-version": "2023-06-01" };
@@ -151,7 +151,7 @@ describe("proxy HTTP layer", () => {
     const sink = createRoutingAttestation({ QODER_PROXY_QA_ATTESTATION_DIR: dir, QODER_PROXY_QA_ATTESTATION_NONCE: nonce })!;
     fetchMock.mockResolvedValueOnce(new Response(streamAfter(new Promise<void>(() => {}), HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }));
     const app = createApp(ENV, fakeSession(), sink);
-    const target = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ stream: true, model: "qmodel_preview", messages: [{ role: "user", content: "target" }] }) });
+    const target = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ stream: true, model: "qmodel_38max", messages: [{ role: "user", content: "target" }] }) });
     expect(target.status).toBe(200);
     const quota = await app.request("/internal/quota", { headers: { "x-api-key": ENV.QODER_PROXY_API_KEY } });
     expect(quota.status).toBe(503);
@@ -186,12 +186,12 @@ describe("proxy HTTP layer", () => {
     await started;
     controller.abort(new Error("quota caller cancelled"));
     await Promise.resolve();
-    const blocked = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "target" }] }) });
+    const blocked = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "target" }] }) });
     expect(blocked.status).toBe(503);
     releaseQuota();
     await Promise.resolve(quotaRequest).catch(() => undefined);
     fetchMock.mockResolvedValueOnce(new Response(streamFrom(HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }));
-    const target = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "target" }] }) });
+    const target = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "target" }] }) });
     expect(target.status).toBe(200);
     sink.close();
   });
@@ -261,7 +261,7 @@ describe("proxy HTTP layer", () => {
     expect(first.headers.get("cache-control")).toBe("private, no-store");
     expect(await first.json()).toMatchObject({ data: [{ id: "auto", type: "model" }], has_more: true, first_id: "auto", last_id: "auto" });
     const next = await app.request("/v1/models?after_id=auto&limit=1", { headers: MODEL_HEADERS });
-    expect(await next.json()).toMatchObject({ data: [{ id: "qmodel_preview" }], has_more: false, first_id: "qmodel_preview", last_id: "qmodel_preview" });
+    expect(await next.json()).toMatchObject({ data: [{ id: "qmodel_38max" }], has_more: false, first_id: "qmodel_38max", last_id: "qmodel_38max" });
   });
 
   it("shares one session catalog load across concurrent list requests", async () => {
@@ -286,10 +286,10 @@ describe("proxy HTTP layer", () => {
 
   it("retrieves an exact model, URL-decodes once, and returns 404 for aliases or disabled IDs", async () => {
     const app = createApp(ENV, fakeSession());
-    const found = await app.request("/v1/models/qmodel%5Fpreview", { headers: MODEL_HEADERS });
+    const found = await app.request("/v1/models/qmodel%5F38max", { headers: MODEL_HEADERS });
     expect(found.status).toBe(200);
-    expect(await found.json()).toMatchObject({ id: "qmodel_preview", display_name: "Qwen3.8-Max-Preview", max_input_tokens: 200000, max_tokens: 1024 });
-    expect((await app.request("/v1/models/Qwen3.8-Max-Preview", { headers: MODEL_HEADERS })).status).toBe(404);
+    expect(await found.json()).toMatchObject({ id: "qmodel_38max", display_name: "Qwen3.8-Max", max_input_tokens: 200000, max_tokens: 1024 });
+    expect((await app.request("/v1/models/Qwen3.8-Max", { headers: MODEL_HEADERS })).status).toBe(404);
     expect((await app.request("/v1/models/%252F", { headers: MODEL_HEADERS })).status).toBe(404);
   });
 
@@ -366,11 +366,11 @@ describe("proxy HTTP layer", () => {
 
   it("routes an exact requested model and returns the resolved ID", async () => {
     fetchMock.mockResolvedValueOnce(new Response(streamFrom(HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }));
-    const response = await createApp(ENV, fakeSession()).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "hi" }] }) });
+    const response = await createApp(ENV, fakeSession()).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "hi" }] }) });
     expect(response.status).toBe(200);
-    expect((await response.json()).model).toBe("qmodel_preview");
-    expect(signedModelKeys).toEqual(["qmodel_preview"]);
-    expect(JSON.parse(signedBodies[0]!).model_config).toMatchObject({ key: "qmodel_preview", display_name: "Qwen3.8-Max-Preview", is_reasoning: true });
+    expect((await response.json()).model).toBe("qmodel_38max");
+    expect(signedModelKeys).toEqual(["qmodel_38max"]);
+    expect(JSON.parse(signedBodies[0]!).model_config).toMatchObject({ key: "qmodel_38max", display_name: "Qwen3.8-Max", is_reasoning: true });
   });
 
   it("returns 404 for an unknown requested model without inference", async () => {
@@ -383,9 +383,9 @@ describe("proxy HTTP layer", () => {
 
   it("uses a validated configured default, otherwise auto", async () => {
     fetchMock.mockImplementation(async () => new Response(streamFrom(HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }));
-    const configured = await createApp({ ...ENV, QODER_CN_INFER_MODEL_KEY: "qmodel_preview" }, fakeSession()).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }) });
+    const configured = await createApp({ ...ENV, QODER_CN_INFER_MODEL_KEY: "qmodel_38max" }, fakeSession()).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }) });
     expect(configured.status).toBe(200);
-    expect(signedModelKeys.at(-1)).toBe("qmodel_preview");
+    expect(signedModelKeys.at(-1)).toBe("qmodel_38max");
     const automatic = await createApp(ENV, fakeSession()).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }) });
     expect(automatic.status).toBe(200);
     expect(signedModelKeys.at(-1)).toBe("auto");
@@ -404,11 +404,11 @@ describe("proxy HTTP layer", () => {
     const dir = join(parent, `qoder-proxy-qa-attestation-${nonce}`);
     const sink = createRoutingAttestation({ QODER_PROXY_QA_ATTESTATION_DIR: dir, QODER_PROXY_QA_ATTESTATION_NONCE: nonce })!;
     fetchMock.mockResolvedValueOnce(new Response(streamFrom(HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }));
-    const response = await createApp(ENV, fakeSession({ listModels: async (_signal, observer) => { observer?.recordCatalogRemoteLoad(); return SNAPSHOT; } }), sink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ stream: true, model: "qmodel_preview", messages: [{ role: "user", content: "never-record-this-prompt" }] }) });
+    const response = await createApp(ENV, fakeSession({ listModels: async (_signal, observer) => { observer?.recordCatalogRemoteLoad(); return SNAPSHOT; } }), sink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ stream: true, model: "qmodel_38max", messages: [{ role: "user", content: "never-record-this-prompt" }] }) });
     await response.text();
     sink.close();
     const record = JSON.parse(await readFile(join(dir, ROUTING_ATTESTATION_FILE), "utf8"));
-    expect(record).toMatchObject({ completed: true, requestModel: "qmodel_preview", resolvedModel: "qmodel_preview", prepareInferModel: "qmodel_preview", responseModel: "qmodel_preview" });
+    expect(record).toMatchObject({ completed: true, requestModel: "qmodel_38max", resolvedModel: "qmodel_38max", prepareInferModel: "qmodel_38max", responseModel: "qmodel_38max" });
     expect(record.counters).toEqual({ preflight: 0, catalogRemoteLoad: 1, modelsList: 0, modelRetrieve: 0, prompt: 1, inference: 1, response: 1, tools: 0, refresh: 0, retries: 0, extraInference: 0 });
     expect(JSON.stringify(record)).not.toContain("never-record-this-prompt");
   });
@@ -427,9 +427,9 @@ describe("proxy HTTP layer", () => {
       },
     }), sink);
     expect((await app.request("/v1/models", { headers: MODEL_HEADERS })).status).toBe(200);
-    expect((await app.request("/v1/models/qmodel_preview", { headers: MODEL_HEADERS })).status).toBe(200);
+    expect((await app.request("/v1/models/qmodel_38max", { headers: MODEL_HEADERS })).status).toBe(200);
     fetchMock.mockResolvedValueOnce(new Response(streamFrom(HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }));
-    expect((await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "hi" }] }) })).status).toBe(200);
+    expect((await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "hi" }] }) })).status).toBe(200);
     sink.close();
     expect(catalogCalls).toBe(3);
     expect(JSON.parse(await readFile(join(dir, ROUTING_ATTESTATION_FILE), "utf8")).counters).toEqual({
@@ -444,7 +444,7 @@ describe("proxy HTTP layer", () => {
     const dir = join(parent, `qoder-proxy-qa-attestation-${nonce}`);
     const sink = createRoutingAttestation({ QODER_PROXY_QA_ATTESTATION_DIR: dir, QODER_PROXY_QA_ATTESTATION_NONCE: nonce })!;
     fetchMock.mockResolvedValueOnce(new Response(streamFrom(HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }));
-    const response = await createApp(ENV, fakeSession(), sink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "secret prompt" }], tools: [{ name: "one", input_schema: { type: "object" } }, { name: "two", input_schema: { type: "object" } }] }) });
+    const response = await createApp(ENV, fakeSession(), sink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "secret prompt" }], tools: [{ name: "one", input_schema: { type: "object" } }, { name: "two", input_schema: { type: "object" } }] }) });
     expect(response.status).toBe(200);
     sink.close();
     const text = await readFile(join(dir, ROUTING_ATTESTATION_FILE), "utf8");
@@ -464,7 +464,7 @@ describe("proxy HTTP layer", () => {
     const app = createApp(ENV, fakeSession({ listModels: async () => { if (++catalogCalls === 1) await gate; return SNAPSHOT; } }), sink);
     const side = app.request("/v1/models", { headers: MODEL_HEADERS });
     await Promise.resolve();
-    const target = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "hi" }] }) });
+    const target = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "hi" }] }) });
     expect(target.status).toBe(503);
     release();
     expect((await side).status).toBe(200);
@@ -512,7 +512,7 @@ describe("proxy HTTP layer", () => {
     await Promise.resolve();
     controller.abort(new Error("auxiliary caller cancelled"));
     expect((await side).status).toBe(502);
-    const targetPromise = app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "target" }] }) });
+    const targetPromise = app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "target" }] }) });
     await Promise.resolve();
     rejectFirst(new CatalogUpstreamError("late unauthorized", 401));
     await lateOperation;
@@ -540,12 +540,12 @@ describe("proxy HTTP layer", () => {
     const app = createApp(ENV, session, sink);
     const automatic = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ stream: true, model: "auto", messages: [{ role: "user", content: "non-target" }] }) });
     expect(automatic.status).toBe(200);
-    const blockedTarget = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "target" }] }) });
+    const blockedTarget = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "target" }] }) });
     expect(blockedTarget.status).toBe(503);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     releaseStream();
     expect(await automatic.text()).toContain("message_stop");
-    const target = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "target" }] }) });
+    const target = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "target" }] }) });
     expect(target.status).toBe(200);
     sink.close();
     expect(JSON.parse(await readFile(join(dir, ROUTING_ATTESTATION_FILE), "utf8"))).toMatchObject({ completed: true, counters: { catalogRemoteLoad: 1, refresh: 0, prompt: 1, inference: 1, response: 1 } });
@@ -563,7 +563,7 @@ describe("proxy HTTP layer", () => {
       .mockResolvedValueOnce(new Response(streamAfter(streamGate, HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }))
       .mockResolvedValueOnce(new Response(streamFrom(HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }));
     const app = createApp(ENV, fakeSession(), sink);
-    const target = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ stream: true, model: "qmodel_preview", messages: [{ role: "user", content: "target" }] }) });
+    const target = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ stream: true, model: "qmodel_38max", messages: [{ role: "user", content: "target" }] }) });
     expect(target.status).toBe(200);
     const blocked = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "auto", messages: [{ role: "user", content: "later" }] }) });
     expect(blocked.status).toBe(503);
@@ -590,7 +590,7 @@ describe("proxy HTTP layer", () => {
     const app = createApp(ENV, session, sink);
     expect((await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "auto", messages: [{ role: "user", content: "non-target" }] }) })).status).toBe(200);
     expect(refreshCalls).toEqual(["refresh"]);
-    expect((await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "target" }] }) })).status).toBe(200);
+    expect((await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "target" }] }) })).status).toBe(200);
     sink.close();
     expect(JSON.parse(await readFile(join(dir, ROUTING_ATTESTATION_FILE), "utf8"))).toMatchObject({ completed: true, counters: { catalogRemoteLoad: 1, refresh: 0, prompt: 1, inference: 1, retries: 0, response: 1 } });
   });
@@ -625,10 +625,10 @@ describe("proxy HTTP layer", () => {
     const disabled = await createApp({ ...ENV, QODER_CN_INFER_MODEL_KEY: "disabled" }, fakeSession(), sink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }) });
     expect(disabled.status).toBe(500);
     fetchMock.mockResolvedValueOnce(new Response(streamFrom(HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }));
-    const target = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "hi" }] }) });
+    const target = await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "hi" }] }) });
     expect(target.status).toBe(200);
     sink.close();
-    expect(JSON.parse(await readFile(join(dir, ROUTING_ATTESTATION_FILE), "utf8"))).toMatchObject({ completed: true, requestModel: "qmodel_preview" });
+    expect(JSON.parse(await readFile(join(dir, ROUTING_ATTESTATION_FILE), "utf8"))).toMatchObject({ completed: true, requestModel: "qmodel_38max" });
   });
 
   it("finalizes exactly one failed record when signing throws after a target claim", async () => {
@@ -637,7 +637,7 @@ describe("proxy HTTP layer", () => {
     attestationRoots.push(parent);
     const dir = join(parent, `qoder-proxy-qa-attestation-${nonce}`);
     const sink = createRoutingAttestation({ QODER_PROXY_QA_ATTESTATION_DIR: dir, QODER_PROXY_QA_ATTESTATION_NONCE: nonce })!;
-    const response = await createApp(ENV, fakeSession({ createSignedAttempt: () => { throw new Error("injected signing failure"); } }), sink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "hi" }] }) });
+    const response = await createApp(ENV, fakeSession({ createSignedAttempt: () => { throw new Error("injected signing failure"); } }), sink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "hi" }] }) });
     expect(response.status).toBe(500);
     sink.close();
     const raw = await readFile(join(dir, ROUTING_ATTESTATION_FILE), "utf8");
@@ -656,13 +656,13 @@ describe("proxy HTTP layer", () => {
     const successSink = createRoutingAttestation({ QODER_PROXY_QA_ATTESTATION_DIR: successDir, QODER_PROXY_QA_ATTESTATION_NONCE: successNonce })!;
     const failureSink = createRoutingAttestation({ QODER_PROXY_QA_ATTESTATION_DIR: failureDir, QODER_PROXY_QA_ATTESTATION_NONCE: failureNonce })!;
     fetchMock.mockResolvedValueOnce(new Response(streamFrom(HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }));
-    const nonStream = await createApp(ENV, fakeSession(), successSink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "hi" }] }) });
+    const nonStream = await createApp(ENV, fakeSession(), successSink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "hi" }] }) });
     expect(nonStream.status).toBe(200);
     successSink.close();
-    expect(JSON.parse(await readFile(join(successDir, ROUTING_ATTESTATION_FILE), "utf8"))).toMatchObject({ completed: true, responseModel: "qmodel_preview", counters: { prompt: 1, response: 1 } });
+    expect(JSON.parse(await readFile(join(successDir, ROUTING_ATTESTATION_FILE), "utf8"))).toMatchObject({ completed: true, responseModel: "qmodel_38max", counters: { prompt: 1, response: 1 } });
 
     fetchMock.mockResolvedValueOnce(new Response(streamFrom(["event: error\ndata: boom\n\n"]), { status: 200, headers: { "content-type": "text/event-stream" } }));
-    const streamed = await createApp(ENV, fakeSession(), failureSink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ stream: true, model: "qmodel_preview", messages: [{ role: "user", content: "hi" }] }) });
+    const streamed = await createApp(ENV, fakeSession(), failureSink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ stream: true, model: "qmodel_38max", messages: [{ role: "user", content: "hi" }] }) });
     expect(await streamed.text()).toContain("event: error");
     failureSink.close();
     expect(JSON.parse(await readFile(join(failureDir, ROUTING_ATTESTATION_FILE), "utf8"))).toMatchObject({ completed: false, responseModel: null, counters: { prompt: 1, response: 0 } });
@@ -689,7 +689,7 @@ describe("proxy HTTP layer", () => {
     const app = createApp(ENV, session, sink);
     expect((await app.request("/v1/models", { headers: MODEL_HEADERS })).status).toBe(200);
     fetchMock.mockResolvedValueOnce(new Response(streamFrom(HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }));
-    expect((await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "hi" }] }) })).status).toBe(200);
+    expect((await app.request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "hi" }] }) })).status).toBe(200);
     sink.close();
     expect(JSON.parse(await readFile(join(dir, ROUTING_ATTESTATION_FILE), "utf8")).counters).toEqual({
       preflight: 0, catalogRemoteLoad: 2, modelsList: 1, modelRetrieve: 0, prompt: 1, inference: 1, response: 1, tools: 0, refresh: 1, retries: 1, extraInference: 0,
@@ -712,7 +712,7 @@ describe("proxy HTTP layer", () => {
       },
     });
     fetchMock.mockResolvedValueOnce(new Response(streamFrom(HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }));
-    const response = await createApp(ENV, session, sink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "hi" }] }) });
+    const response = await createApp(ENV, session, sink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "hi" }] }) });
     expect(response.status).toBe(200);
     sink.close();
     expect(JSON.parse(await readFile(join(dir, ROUTING_ATTESTATION_FILE), "utf8")).counters).toEqual({ preflight: 0, catalogRemoteLoad: 2, modelsList: 0, modelRetrieve: 0, prompt: 1, inference: 1, response: 1, tools: 0, refresh: 1, retries: 1, extraInference: 0 });
@@ -739,7 +739,7 @@ describe("proxy HTTP layer", () => {
     fetchMock
       .mockResolvedValueOnce(new Response(new ReadableStream(), { status: 401 }))
       .mockResolvedValueOnce(new Response(streamFrom(HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }));
-    const response = await createApp(ENV, session, sink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "hi" }] }) });
+    const response = await createApp(ENV, session, sink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "hi" }] }) });
     expect(response.status).toBe(200);
     sink.close();
     expect(JSON.parse(await readFile(join(dir, ROUTING_ATTESTATION_FILE), "utf8")).counters).toEqual({ preflight: 0, catalogRemoteLoad: 2, modelsList: 0, modelRetrieve: 0, prompt: 1, inference: 2, response: 1, tools: 0, refresh: 2, retries: 2, extraInference: 1 });
@@ -753,11 +753,11 @@ describe("proxy HTTP layer", () => {
     const sink = createRoutingAttestation({ QODER_PROXY_QA_ATTESTATION_DIR: dir, QODER_PROXY_QA_ATTESTATION_NONCE: nonce })!;
     const first = new Response(new ReadableStream(), { status: 401 });
     fetchMock.mockResolvedValueOnce(first).mockResolvedValueOnce(new Response(streamFrom(HAPPY), { status: 200, headers: { "content-type": "text/event-stream" } }));
-    const response = await createApp(ENV, fakeSession(), sink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_preview", messages: [{ role: "user", content: "hi" }] }) });
+    const response = await createApp(ENV, fakeSession(), sink).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ model: "qmodel_38max", messages: [{ role: "user", content: "hi" }] }) });
     expect(response.status).toBe(200);
     sink.close();
     const record = JSON.parse(await readFile(join(dir, ROUTING_ATTESTATION_FILE), "utf8"));
-    expect(record).toMatchObject({ completed: true, responseModel: "qmodel_preview" });
+    expect(record).toMatchObject({ completed: true, responseModel: "qmodel_38max" });
     expect(record.counters).toEqual({ preflight: 0, catalogRemoteLoad: 0, modelsList: 0, modelRetrieve: 0, prompt: 1, inference: 2, response: 1, tools: 0, refresh: 1, retries: 1, extraInference: 1 });
   });
 });

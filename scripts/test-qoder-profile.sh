@@ -10,7 +10,7 @@ OUT=$(env -i HOME="${HOME:-/tmp}" PATH="${PATH:-/usr/bin:/bin}" \
   bash -c 'source "$1"; printf "base=%s\nkey=%s\nopus=%s\nsonnet=%s\nhaiku=%s\nstatusline=%s\n" "$ANTHROPIC_BASE_URL" "$ANTHROPIC_AUTH_TOKEN" "$ANTHROPIC_DEFAULT_OPUS_MODEL" "$ANTHROPIC_DEFAULT_SONNET_MODEL" "$ANTHROPIC_DEFAULT_HAIKU_MODEL" "$QODER_PROXY_STATUSLINE"' bash "$PROFILE")
 printf '%s\n' "$OUT" | grep -Fx 'base=http://127.0.0.1:43123' >/dev/null
 printf '%s\n' "$OUT" | grep -Fx 'key=temporary-test-key' >/dev/null
-printf '%s\n' "$OUT" | grep -Fx 'opus=qmodel_preview[1m]' >/dev/null
+printf '%s\n' "$OUT" | grep -Fx 'opus=qmodel_38max[1m]' >/dev/null
 printf '%s\n' "$OUT" | grep -Fx 'sonnet=qmodel_latest[1m]' >/dev/null
 printf '%s\n' "$OUT" | grep -Fx 'haiku=q36fmodel[1m]' >/dev/null
 printf '%s\n' "$OUT" | grep -Fx 'statusline=1' >/dev/null

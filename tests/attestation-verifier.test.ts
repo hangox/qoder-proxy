@@ -4,7 +4,7 @@ import { verifyRoutingAttestation } from "./verify-routing-attestation.mjs";
 
 const VALID = {
   schema: "qoder-proxy-live-attestation/v1", message: "请求溯源", modelProvided: true,
-  requestModel: "qmodel_preview", resolvedModel: "qmodel_preview", prepareInferModel: "qmodel_preview", responseModel: "qmodel_preview", completed: true,
+  requestModel: "qmodel_38max", resolvedModel: "qmodel_38max", prepareInferModel: "qmodel_38max", responseModel: "qmodel_38max", completed: true,
   counters: { preflight: 1, catalogRemoteLoad: 1, modelsList: 1, modelRetrieve: 1, prompt: 1, inference: 1, response: 1, tools: 0, refresh: 0, retries: 0, extraInference: 0 },
 };
 

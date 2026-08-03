@@ -232,6 +232,22 @@ export function createApp(env: Record<string, string | undefined> = process.env,
       }
     } finally { auxiliary?.release(auxiliaryCompleted); }
   });
+  app.get("/internal/model-routing", requireApiKey(env, true), async (c) => {
+    if (!authSession) return c.json(apiError("api_error", "server auth session not initialized"), 500);
+    try { rejectUnexpectedQuery(c); }
+    catch { return c.json(apiError("invalid_request_error", "query parameters are not supported"), 400); }
+    const routingKey = env.QODER_CN_INFER_MODEL_KEY;
+    if (!routingKey) return c.json(apiError("api_error", "runtime routing key is not configured"), 500);
+    try {
+      const snapshot = await authSession.listModels(c.req.raw.signal);
+      if (!findModelById(snapshot.models, routingKey)) {
+        return c.json(apiError("not_found_error", "runtime routing key unavailable"), 404);
+      }
+      return c.json({ ok: true, routingKey, generation: snapshot.generation });
+    } catch (error) {
+      return catalogFailure(c, error);
+    }
+  });
   app.all("/internal/quota", requireApiKey(env, true), (c) => {
     c.header("allow", "GET");
     return c.json(apiError("invalid_request_error", "method not allowed"), 405);
@@ -281,7 +297,7 @@ export function createApp(env: Record<string, string | undefined> = process.env,
     let resolvedModel = resolved.resolvedModel!;
     const tools = Array.isArray(anthropic.tools) ? anthropic.tools.length : 0;
     let attestation: ReturnType<RoutingMessageLease["claim"]> | undefined;
-    const isAttestationTarget = requestModel === "qmodel_preview" && resolvedModel.key === "qmodel_preview";
+    const isAttestationTarget = requestModel === "qmodel_38max" && resolvedModel.key === "qmodel_38max";
     if (isAttestationTarget) {
       try {
         attestation = messageLease?.claim({ modelProvided: true, requestModel, resolvedModel: resolvedModel.key, tools, catalogModels: snapshot.models.map((model) => model.key) });

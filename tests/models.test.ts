@@ -12,7 +12,7 @@ import {
 function rawModel(key: string, overrides: Record<string, unknown> = {}) {
   return {
     key,
-    display_name: key === "auto" ? "Auto" : "Qwen3.8-Max-Preview",
+    display_name: key === "auto" ? "Auto" : "Qwen3.8-Max",
     enable: true,
     is_default: key === "auto",
     is_vl: false,
@@ -26,12 +26,12 @@ function rawModel(key: string, overrides: Record<string, unknown> = {}) {
 
 describe("Qoder assistant catalog", () => {
   it("只选择 assistant scene、按官方 enable 语义过滤并保持上游权威顺序", () => {
-    const { enable: _enable, ...enabledByDefault } = rawModel("qmodel_preview");
+    const { enable: _enable, ...enabledByDefault } = rawModel("qmodel_38max");
     const models = parseQoderAssistantCatalog({
       chat: [rawModel("chat-only")],
       assistant: [enabledByDefault, rawModel("disabled-false", { enable: false }), rawModel("disabled-zero", { enable: 0 }), rawModel("auto")],
     });
-    expect(models.map((model) => model.key)).toEqual(["qmodel_preview", "auto"]);
+    expect(models.map((model) => model.key)).toEqual(["qmodel_38max", "auto"]);
   });
 
   it("支持 key/model_key 与 display_name/name 回退，并过滤 BYOK enterprise", () => {
@@ -58,7 +58,7 @@ describe("Qoder assistant catalog", () => {
   });
 
   it("ModelInfo 使用 context_config 证明的最大可选窗口，并把输出上限压到 1024", () => {
-    const [model] = parseQoderAssistantCatalog({ assistant: [rawModel("qmodel_preview", {
+    const [model] = parseQoderAssistantCatalog({ assistant: [rawModel("qmodel_38max", {
       is_vl: true,
       is_reasoning: true,
       max_output_tokens: 8192,
@@ -81,9 +81,9 @@ describe("Qoder assistant catalog", () => {
       ],
     });
     expect(info).toMatchObject({
-      id: "qmodel_preview",
+      id: "qmodel_38max",
       type: "model",
-      display_name: "Qwen3.8-Max-Preview",
+      display_name: "Qwen3.8-Max",
       created_at: UNKNOWN_MODEL_CREATED_AT,
       max_input_tokens: 1000000,
       max_tokens: 1024,
@@ -116,10 +116,10 @@ describe("Qoder assistant catalog", () => {
   });
 
   it("exact lookup 不做大小写、display name 或 alias 匹配", () => {
-    const models = parseQoderAssistantCatalog({ assistant: [rawModel("qmodel_preview")] });
-    expect(findModelById(models, "qmodel_preview")?.key).toBe("qmodel_preview");
+    const models = parseQoderAssistantCatalog({ assistant: [rawModel("qmodel_38max")] });
+    expect(findModelById(models, "qmodel_38max")?.key).toBe("qmodel_38max");
     expect(findModelById(models, "QMODEL_PREVIEW")).toBeUndefined();
-    expect(findModelById(models, "Qwen3.8-Max-Preview")).toBeUndefined();
+    expect(findModelById(models, "Qwen3.8-Max")).toBeUndefined();
   });
 });
 

@@ -9,7 +9,7 @@ const MESSAGE = "请求溯源" as const;
 const RECORD_FILE = "routing-attestation.jsonl";
 const NONCE_RE = /^[a-f0-9]{32}$/;
 const MODEL_RE = /^[A-Za-z0-9._-]{1,128}$/;
-const TARGET_MODEL = "qmodel_preview";
+const TARGET_MODEL = "qmodel_38max";
 
 type AttestedModel = string | null;
 
@@ -91,7 +91,7 @@ class LocalRoutingAttestation implements RoutingAttestation {
   recordCatalogRemoteLoad(): void { if (this.targetActive) this.counters.catalogRemoteLoad++; }
   recordRefresh(): void { if (this.targetActive) this.counters.refresh++; }
   private assertTargetModel(value: string | undefined): string {
-    if (value !== TARGET_MODEL || !MODEL_RE.test(value)) throw new Error("QA attestation 只接受 qmodel_preview 目标模型");
+    if (value !== TARGET_MODEL || !MODEL_RE.test(value)) throw new Error("QA attestation 只接受 qmodel_38max 目标模型");
     return value;
   }
   beginAuxiliary(): RoutingAuxiliaryLease {

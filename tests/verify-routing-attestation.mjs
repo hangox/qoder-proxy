@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 const TOP_LEVEL_KEYS = ["completed", "counters", "message", "modelProvided", "prepareInferModel", "requestModel", "resolvedModel", "responseModel", "schema"];
 const COUNTER_KEYS = ["catalogRemoteLoad", "extraInference", "inference", "modelRetrieve", "modelsList", "preflight", "prompt", "refresh", "response", "retries", "tools"];
 const MODEL_RE = /^[A-Za-z0-9._-]{1,128}$/;
-const TARGET_MODEL = "qmodel_preview";
+const TARGET_MODEL = "qmodel_38max";
 function sameKeys(value, expected) { return value !== null && typeof value === "object" && !Array.isArray(value) && JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort()); }
 export function stripTerminalControls(line) {
   let clean = line.replace(/\x1b\][^\x07\x1b\r\n]*(?:\x07|\x1b\\)/g, "");

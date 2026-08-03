@@ -19,19 +19,19 @@ async function fixtureEnv(seed: string): Promise<{ dir: string; env: Record<stri
 }
 function claimTarget(sink: NonNullable<ReturnType<typeof createRoutingAttestation>>, tools = 0) {
   const lease = sink.beginMessage();
-  return lease.claim({ modelProvided: true, requestModel: "qmodel_preview", resolvedModel: "qmodel_preview", tools, catalogModels: ["qmodel_preview"] });
+  return lease.claim({ modelProvided: true, requestModel: "qmodel_38max", resolvedModel: "qmodel_38max", tools, catalogModels: ["qmodel_38max"] });
 }
 function successfulRecord(sink: NonNullable<ReturnType<typeof createRoutingAttestation>>) {
   sink.recordPreflight();
   const auxiliary = sink.beginAuxiliary();
-  auxiliary.allowCatalogModels(["qmodel_preview"]);
+  auxiliary.allowCatalogModels(["qmodel_38max"]);
   auxiliary.recordCatalogRemoteLoad();
   auxiliary.recordModelsList();
   auxiliary.recordModelRetrieve();
   auxiliary.release(true);
   const lease = sink.beginMessage();
-  const request = lease.claim({ modelProvided: true, requestModel: "qmodel_preview", resolvedModel: "qmodel_preview", tools: 0, catalogModels: ["qmodel_preview"] });
-  request.setPrepareInferModel("qmodel_preview");
+  const request = lease.claim({ modelProvided: true, requestModel: "qmodel_38max", resolvedModel: "qmodel_38max", tools: 0, catalogModels: ["qmodel_38max"] });
+  request.setPrepareInferModel("qmodel_38max");
   request.recordInference();
   request.finalize(true);
 }
@@ -56,7 +56,7 @@ describe("routing QA attestation", () => {
     expect(fileStat.mode & 0o077).toBe(0);
     expect(JSON.parse(await readFile(file, "utf8"))).toEqual({
       schema: ROUTING_ATTESTATION_SCHEMA, message: "请求溯源", modelProvided: true,
-      requestModel: "qmodel_preview", resolvedModel: "qmodel_preview", prepareInferModel: "qmodel_preview", responseModel: "qmodel_preview", completed: true,
+      requestModel: "qmodel_38max", resolvedModel: "qmodel_38max", prepareInferModel: "qmodel_38max", responseModel: "qmodel_38max", completed: true,
       counters: { preflight: 1, catalogRemoteLoad: 1, modelsList: 1, modelRetrieve: 1, prompt: 1, inference: 1, response: 1, tools: 0, refresh: 0, retries: 0, extraInference: 0 },
     });
   });
@@ -67,7 +67,7 @@ describe("routing QA attestation", () => {
       preflight: async () => ({}) as AuthSession,
       bind: (_env, _session, sink) => {
         const request = claimTarget(sink!);
-        request.setPrepareInferModel("qmodel_preview"); request.recordInference(); request.finalize(true);
+        request.setPrepareInferModel("qmodel_38max"); request.recordInference(); request.finalize(true);
         return { close: () => sink!.close() };
       },
     });
@@ -84,11 +84,11 @@ describe("routing QA attestation", () => {
       { modelProvided: true, requestModel: "unknown", resolvedModel: "unknown" },
     ]) {
       const lease = sink.beginMessage();
-      expect(() => lease.claim({ ...input, tools: 0, catalogModels: ["auto", "qmodel_preview"] })).toThrow(/claim|目标模型/);
+      expect(() => lease.claim({ ...input, tools: 0, catalogModels: ["auto", "qmodel_38max"] })).toThrow(/claim|目标模型/);
       lease.release();
     }
     const request = claimTarget(sink);
-    request.setPrepareInferModel("qmodel_preview"); request.recordInference(); request.finalize(true);
+    request.setPrepareInferModel("qmodel_38max"); request.recordInference(); request.finalize(true);
     sink.close();
     expect(JSON.parse(await readFile(join(dir, ROUTING_ATTESTATION_FILE), "utf8")).completed).toBe(true);
   });
@@ -114,7 +114,7 @@ describe("routing QA attestation", () => {
     expect(() => auxiliary.recordCatalogRemoteLoad()).not.toThrow();
     expect(() => auxiliary.recordRefresh()).not.toThrow();
     expect(() => auxiliary.recordModelsList()).toThrow(/失效/);
-    expect(() => auxiliary.allowCatalogModels(["qmodel_preview"])).toThrow(/失效/);
+    expect(() => auxiliary.allowCatalogModels(["qmodel_38max"])).toThrow(/失效/);
     sink.close();
   });
 
@@ -134,10 +134,10 @@ describe("routing QA attestation", () => {
     completed.recordCatalogRemoteLoad();
     completed.recordModelsList();
     completed.recordModelRetrieve();
-    completed.allowCatalogModels(["qmodel_preview"]);
+    completed.allowCatalogModels(["qmodel_38max"]);
     completed.release(true);
     const request = claimTarget(sink);
-    request.setPrepareInferModel("qmodel_preview");
+    request.setPrepareInferModel("qmodel_38max");
     request.recordInference();
     request.finalize(true);
     failed.recordCatalogRemoteLoad();
@@ -154,11 +154,11 @@ describe("routing QA attestation", () => {
     const first = sink.beginAuxiliary();
     const second = sink.beginAuxiliary();
     const rejectedFirst = sink.beginMessage();
-    expect(() => rejectedFirst.claim({ modelProvided: true, requestModel: "qmodel_preview", resolvedModel: "qmodel_preview", tools: 0, catalogModels: ["qmodel_preview"] })).toThrow(/claim/);
+    expect(() => rejectedFirst.claim({ modelProvided: true, requestModel: "qmodel_38max", resolvedModel: "qmodel_38max", tools: 0, catalogModels: ["qmodel_38max"] })).toThrow(/claim/);
     rejectedFirst.release();
     first.release();
     const rejectedSecond = sink.beginMessage();
-    expect(() => rejectedSecond.claim({ modelProvided: true, requestModel: "qmodel_preview", resolvedModel: "qmodel_preview", tools: 0, catalogModels: ["qmodel_preview"] })).toThrow(/claim/);
+    expect(() => rejectedSecond.claim({ modelProvided: true, requestModel: "qmodel_38max", resolvedModel: "qmodel_38max", tools: 0, catalogModels: ["qmodel_38max"] })).toThrow(/claim/);
     rejectedSecond.release();
     second.release();
     const target = claimTarget(sink);

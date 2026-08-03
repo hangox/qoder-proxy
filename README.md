@@ -47,13 +47,13 @@ curl -sS http://127.0.0.1:7788/v1/messages \
   -H "content-type: application/json" \
   -H "x-api-key: $QODER_PROXY_API_KEY" \
   -d '{
-    "model": "qmodel_preview",
+    "model": "qmodel_38max",
     "max_tokens": 1024,
     "messages": [{"role": "user", "content": "你好"}]
   }'
 ```
 
-当前已核实映射：`qmodel_preview` → `Qwen3.8-Max-Preview`。该 ID 会同时进入 CN `model_config.key`、官方签名 `prepareInferRequest` 和 Anthropic 响应的 `model` 字段。请求省略 `model` 时，可用 `QODER_CN_INFER_MODEL_KEY` 设置代理默认值；该值仍必须存在于当前启用目录，否则代理 fail-closed。未设置默认值时使用启用的 `auto` 条目。
+当前已核实映射：`qmodel_38max` → `Qwen3.8-Max`。该 ID 会同时进入 CN `model_config.key`、官方签名 `prepareInferRequest` 和 Anthropic 响应的 `model` 字段。请求省略 `model` 时，可用 `QODER_CN_INFER_MODEL_KEY` 设置代理默认值；该值仍必须存在于当前启用目录，否则代理 fail-closed。未设置默认值时使用启用的 `auto` 条目。
 
 ## 导入已有 Qoder 登录
 

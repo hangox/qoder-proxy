@@ -33,9 +33,11 @@ const server = Bun.serve({
   hostname: "127.0.0.1",
   port,
   fetch(request) {
-    if (new URL(request.url).pathname !== "/internal/quota") return new Response(null, { status: 404 });
+    const pathname = new URL(request.url).pathname;
     if (request.headers.get("authorization") !== "Bearer " + token) return new Response(null, { status: 401 });
-    return Response.json({ percentage: 12, pid: process.pid });
+    if (pathname === "/internal/quota") return Response.json({ percentage: 12, pid: process.pid });
+    if (pathname === "/internal/model-routing") return Response.json({ ok: true, routingKey: process.env.QODER_CN_INFER_MODEL_KEY });
+    return new Response(null, { status: 404 });
   },
 });
 process.on("SIGTERM", () => { server.stop(); process.exit(0); });
@@ -207,10 +209,10 @@ describe("Qoder runtime manager lease lifecycle", () => {
     for (const tier of ["opus", "sonnet", "haiku"] as const) {
       const lease = await manager.acquire(`tier-${tier}`, process.pid, tier);
       expect(lease.tier).toBe(tier);
-      expect(lease.routingKey).toBe(({ opus: "qmodel_preview", sonnet: "qmodel_latest", haiku: "q36fmodel" } as const)[tier]);
+      expect(lease.routingKey).toBe(({ opus: "qmodel_38max", sonnet: "qmodel_latest", haiku: "q36fmodel" } as const)[tier]);
       manager.release(`tier-${tier}`, process.pid, lease.leaseId);
     }
-    expect((await readFile(fake.routes, "utf8")).replace(/\s+/g, " ").trim()).toBe("qmodel_preview qmodel_latest q36fmodel");
+    expect((await readFile(fake.routes, "utf8")).replace(/\s+/g, " ").trim()).toBe("qmodel_38max qmodel_latest q36fmodel");
   });
 
   it("uses distinct credentials per run and rejects cross-run keys", async () => {
