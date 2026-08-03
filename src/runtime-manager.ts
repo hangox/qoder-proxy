@@ -13,7 +13,7 @@ export type { QoderTier } from "./model-registry.ts";
 export type RuntimeEnv = Record<string, string | undefined>;
 export type RuntimeIo = { stdout(value: string): void; stderr(value: string): void };
 type RuntimeRequest = { op: "acquire" | "release" | "shutdown" | "ping" | "status"; runId?: string; ownerPid?: number; leaseId?: string; tier?: string };
-type RuntimeResponse = { ok: true; active?: boolean; runId?: string; ownerPid?: number; leaseId?: string; baseUrl?: string; socketPath?: string; token?: string; released?: boolean; tier?: QoderTier; routingKey?: string } | { ok: false; error: string };
+type RuntimeResponse = { ok: true; active?: boolean; runId?: string; ownerPid?: number; leaseId?: string; baseUrl?: string; socketPath?: string; token?: string; released?: boolean; tier?: QoderTier; routingKey?: string } | { ok: false; error: string; code?: "model-unavailable" | "catalog-unavailable" | "startup-failed"; routingKey?: string };
 type Lease = { runId: string; token: string; leaseId: string; tier: QoderTier; baseUrl: string; child: ChildProcess; owners: Set<number>; invalid: boolean };
 const QODER_RUNTIME_STATUS_SCHEMA = "qoder-runtime/status/v1";
 function tierValue(value: unknown): QoderTier {
@@ -76,21 +76,37 @@ async function requestStatus(url: string, token: string): Promise<{ status: numb
     request.end();
   });
 }
-async function waitReady(baseUrl: string, token: string): Promise<void> {
+function startupErrorFromFile(path: string): Error | undefined {
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8")) as { code?: unknown; routingKey?: unknown; status?: unknown };
+    if (value.code === "model-unavailable" && typeof value.routingKey === "string") return new QoderModelUnavailableError(value.routingKey);
+    if (value.code === "catalog-unavailable") return new QoderModelCatalogUnavailableError();
+  } catch {}
+  return undefined;
+}
+
+function childExitError(child: ChildProcess, startupErrorPath: string): Error {
+  return startupErrorFromFile(startupErrorPath) ?? new Error(`qoder-proxy 在 readiness 前退出（status=${child.exitCode ?? "none"}, signal=${child.signalCode ?? "none"}）`);
+}
+
+async function waitReady(baseUrl: string, token: string, child: ChildProcess, startupErrorPath: string, routingKey: string): Promise<void> {
   const deadline = Date.now() + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
+    if (child.exitCode !== null || child.signalCode !== null) throw childExitError(child, startupErrorPath);
     try {
       if ((await requestStatus(`${baseUrl}/internal/quota`, token)).status !== 200) throw new Error("quota readiness failed");
       const routing = await requestStatus(`${baseUrl}/internal/model-routing`, token);
       if (routing.status === 200) return;
-      if (routing.status === 404) throw new QoderModelUnavailableError("runtime routing key");
+      if (routing.status === 404) throw new QoderModelUnavailableError(routingKey);
       if (routing.status === 500 || routing.status === 502) throw new QoderModelCatalogUnavailableError();
       throw new Error(`model routing readiness failed: ${routing.status}`);
     } catch (error) {
       if (error instanceof QoderModelUnavailableError || error instanceof QoderModelCatalogUnavailableError) throw error;
+      if (child.exitCode !== null || child.signalCode !== null) throw childExitError(child, startupErrorPath);
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
+  if (child.exitCode !== null || child.signalCode !== null) throw childExitError(child, startupErrorPath);
   throw new Error("qoder-proxy readiness 超时");
 }
 function killChild(child: ChildProcess): void { if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM"); }
@@ -162,13 +178,26 @@ export class QoderRuntimeManager {
       childEnv.QODER_CN_MACHINE_ID_FILE = machineId;
       delete childEnv.QODER_CN_MACHINE_ID;
     }
+    const startupErrorPath = join(runtimeDirectory(this.env), `startup-error-${leaseId}.json`);
+    childEnv.QODER_PROXY_STARTUP_ERROR_FILE = startupErrorPath;
+    try { unlinkSync(startupErrorPath); } catch {}
     const child = spawn(command.command, command.args, { cwd: command.cwd, detached: false, stdio: "ignore", env: childEnv });
     const lease: Lease = { runId, token, leaseId, tier, baseUrl: `http://127.0.0.1:${port}`, child, owners: new Set([ownerPid]), invalid: false }; this.leases.set(runId, lease);
     child.once("exit", () => {
       lease.invalid = true;
       if (this.leases.get(runId) === lease) { this.leases.delete(runId); this.armIdleExit(); }
     });
-    try { await waitReady(lease.baseUrl, token); return { runId, leaseId, baseUrl: lease.baseUrl, socketPath: socketPath(this.env), token, tier, routingKey }; } catch (error) { this.leases.delete(runId); killChild(child); throw error; }
+    try {
+      await waitReady(lease.baseUrl, token, child, startupErrorPath, routingKey);
+      try { unlinkSync(startupErrorPath); } catch {}
+      return { runId, leaseId, baseUrl: lease.baseUrl, socketPath: socketPath(this.env), token, tier, routingKey };
+    } catch (error) {
+      this.leases.delete(runId);
+      killChild(child);
+      try { unlinkSync(startupErrorPath); } catch {}
+      await waitChildExit(child);
+      throw error;
+    }
   }
   release(runId: string, ownerPid: number, leaseId?: string): void {
     const lease = this.leases.get(runId);
@@ -260,7 +289,12 @@ export class QoderRuntimeManager {
       if (request.op === "release") { this.release(request.runId || "", request.ownerPid || 0, request.leaseId); socket.end(JSON.stringify({ ok: true, released: true, runId: request.runId, ownerPid: request.ownerPid, leaseId: request.leaseId, socketPath: socketPath(this.env) }) + "\n"); return; }
       if (request.op === "shutdown") { await this.stop(); socket.end('{"ok":true}\n'); return; }
       throw new Error("未知 runtime 操作");
-    } catch (error) { socket.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : "runtime failed" }) + "\n"); }
+    } catch (error) { socket.end(JSON.stringify(QoderRuntimeManager.runtimeError(error)) + "\n"); }
+  }
+  private static runtimeError(error: unknown): RuntimeResponse {
+    if (error instanceof QoderModelUnavailableError) return { ok: false, error: error.message, code: "model-unavailable", routingKey: error.routingKey };
+    if (error instanceof QoderModelCatalogUnavailableError) return { ok: false, error: error.message, code: "catalog-unavailable" };
+    return { ok: false, error: error instanceof Error ? error.message : "runtime failed", code: "startup-failed" };
   }
   async stop(): Promise<void> {
     if (this.stopped && !this.server) return;
@@ -297,7 +331,13 @@ export async function runRuntimeCommand(args: string[], env: RuntimeEnv = proces
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
-  if (!response) throw new Error("runtime daemon 启动超时"); if (!response.ok) throw new Error(response.error);
+  if (!response) throw new Error("runtime daemon 启动超时");
+  if (!response.ok) {
+    const error = new Error(response.error) as Error & { code?: string; routingKey?: string };
+    error.code = response.code;
+    error.routingKey = response.routingKey;
+    throw error;
+  }
   if (command === "acquire") io.stdout(`${JSON.stringify({ runId: response.runId, leaseId: response.leaseId, baseUrl: response.baseUrl, socketPath: response.socketPath, token: response.token, tier: response.tier, routingKey: response.routingKey })}\n`);
   else if (command === "status") io.stdout(`${JSON.stringify({ active: response.active === true, runId: response.runId, ownerPid: response.ownerPid, leaseId: response.leaseId, baseUrl: response.baseUrl, socketPath: response.socketPath })}\n`);
   else if (command === "release") io.stdout(`${JSON.stringify({ released: response.released === true, runId: response.runId, ownerPid: response.ownerPid, leaseId: response.leaseId, socketPath: response.socketPath })}\n`);

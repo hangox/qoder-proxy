@@ -2,6 +2,7 @@
 
 import { serve } from "@hono/node-server";
 import type { ServerType } from "@hono/node-server";
+import { chmodSync, renameSync, writeFileSync } from "node:fs";
 import { createApp } from "./proxy.ts";
 import { AuthSession, CatalogUpstreamError, PendingPreflightPersistenceError, type CredentialStore } from "./auth/session.ts";
 import { DEFAULT_QODER_SOURCE_DIR, importStore, prepareQoderImport, type ImportDependencies, type PreparedQoderImport } from "./auth/import.ts";
@@ -92,6 +93,26 @@ function writeJson(io: CliIo, value: Record<string, unknown>): void {
   io.stdout(`${JSON.stringify(value)}\n`);
 }
 
+function startupErrorRecord(error: unknown): Record<string, unknown> {
+  if (error instanceof QoderModelUnavailableError) return { code: "model-unavailable", routingKey: error.routingKey };
+  if (error instanceof CatalogUpstreamError) return { code: "catalog-unavailable", status: error.status };
+  if (error instanceof Error && /model catalog unavailable/i.test(error.message)) return { code: "catalog-unavailable" };
+  return { code: "startup-failed" };
+}
+
+function writeStartupError(env: Record<string, string | undefined>, error: unknown): void {
+  const path = env.QODER_PROXY_STARTUP_ERROR_FILE;
+  if (!path) return;
+  try {
+    const temp = `${path}.tmp.${process.pid}`;
+    writeFileSync(temp, `${JSON.stringify(startupErrorRecord(error))}\n`, { encoding: "utf8", mode: 0o600 });
+    chmodSync(temp, 0o600);
+    renameSync(temp, path);
+  } catch {
+    try { writeFileSync(`${path}.tmp.${process.pid}`, "{\"code\":\"startup-failed\"}\n", { encoding: "utf8", mode: 0o600 }); } catch {}
+  }
+}
+
 function requireSingleValue(args: string[], index: number, flag: string): string {
   const value = args[index + 1];
   if (value === undefined || value.startsWith("--")) throw new Error(`${flag} 缺少参数`);
@@ -178,6 +199,7 @@ export async function runCli(
       signal?.throwIfAborted();
       return (dependencies.bind ?? defaultBind)(resolvedEnv, session, routingAttestation);
     } catch (error) {
+      writeStartupError(resolvedEnv, error);
       routingAttestation?.close();
       throw error;
     }
