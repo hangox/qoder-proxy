@@ -54,26 +54,30 @@ function appendRuntimeStderr(env: RuntimeEnv, chunk: Buffer | string): void {
     chmodSync(path, 0o600);
   } catch {}
 }
-function createRuntimeStderrWriter(env: RuntimeEnv, secret: string): { write(chunk: Buffer | string): void; flush(): void } {
+export function createStreamingSecretRedactor(secret: string, sink: (chunk: string) => void): { write(chunk: Buffer | string): void; flush(): void } {
+  if (secret.length === 0) throw new Error("脱敏 secret 不能为空");
+  const replacement = secret.includes("[redacted]") || secret.includes("[REDACTED]") ? "" : "[redacted]";
   let carry = "";
   let flushed = false;
   const write = (chunk: Buffer | string): void => {
     if (flushed) return;
     const combined = carry + (Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk);
-    const keep = Math.max(0, secret.length - 1);
-    const found = combined.includes(secret);
-    const safe = found ? combined.split(secret).join("[redacted]") : combined;
+    const keep = secret.length - 1;
+    const safe = combined.split(secret).join(replacement);
     const cutoff = Math.max(0, safe.length - keep);
-    appendRuntimeStderr(env, safe.slice(0, cutoff));
-    carry = found ? safe.slice(cutoff) : combined.slice(cutoff);
+    sink(safe.slice(0, cutoff));
+    carry = safe.length > cutoff ? safe.slice(cutoff) : "";
   };
   const flush = (): void => {
     if (flushed) return;
     flushed = true;
-    appendRuntimeStderr(env, carry.split(secret).join("[redacted]"));
+    sink(carry.split(secret).join(replacement));
     carry = "";
   };
   return { write, flush };
+}
+function createRuntimeStderrWriter(env: RuntimeEnv, secret: string): { write(chunk: Buffer | string): void; flush(): void } {
+  return createStreamingSecretRedactor(secret, (chunk) => appendRuntimeStderr(env, chunk));
 }
 function reaperIntervalMs(env: RuntimeEnv): number {
   const parsed = Number(env.QODER_RUNTIME_REAPER_MS);

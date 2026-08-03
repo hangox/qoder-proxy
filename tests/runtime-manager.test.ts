@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
-import { QoderRuntimeManager, runRuntimeCommand } from "../src/runtime-manager.ts";
+import { createStreamingSecretRedactor, QoderRuntimeManager, runRuntimeCommand } from "../src/runtime-manager.ts";
 import { QODER_TIER_REGISTRY } from "../src/model-registry.ts";
 import { resolveMachineIdSource } from "../src/machine-id.ts";
 
@@ -34,7 +34,13 @@ if (process.env.QODER_RUNTIME_TEST_SPLIT_STDERR === "1") {
   setTimeout(() => process.stderr.write(secret.slice(17) + "\\n"), 100);
 }
 if (process.env.QODER_RUNTIME_TEST_LARGE_STDERR === "1") {
-  process.stderr.write("x".repeat(300_000) + process.env.QODER_PROXY_API_KEY! + "\\n");
+  let index = 0;
+  const writeLarge = () => {
+    process.stderr.write("x".repeat(300_000) + process.env.QODER_PROXY_API_KEY! + "\\n");
+    index += 1;
+    if (index < 5) setTimeout(writeLarge, 15);
+  };
+  writeLarge();
 }
 const port = Number(process.env.PORT);
 const token = process.env.QODER_PROXY_API_KEY!;
@@ -88,6 +94,37 @@ function envFor(fake: { executable: string; starts: string; routes: string; mach
     TMPDIR: fake.directory,
   };
 }
+
+describe("Qoder runtime stderr secret redaction", () => {
+  it("redacts repeated, overlapping, short-secret, and arbitrary chunk boundaries", () => {
+    const secret = "aba";
+    const chunks = ["a", "b", "aaba", "xx", "aba", "a"];
+    const output: string[] = [];
+    const redactor = createStreamingSecretRedactor(secret, (chunk) => output.push(chunk));
+    for (const chunk of chunks) redactor.write(chunk);
+    redactor.flush();
+    const value = output.join("");
+    expect(value).not.toContain(secret);
+    expect(value).toContain("[redacted]");
+    expect(value).toContain("xx");
+  });
+
+  it("keeps an arbitrary random-like partition safe through flush", () => {
+    const secret = "token-1234567890";
+    const payload = `prefix-${secret}-middle-${secret}-${secret}-suffix`;
+    const output: string[] = [];
+    const redactor = createStreamingSecretRedactor(secret, (chunk) => output.push(chunk));
+    for (let index = 0; index < payload.length; index += 3) redactor.write(payload.slice(index, index + 3));
+    redactor.flush();
+    const value = output.join("");
+    expect(value).not.toContain(secret);
+    expect(value).toContain("[redacted]");
+  });
+
+  it("rejects an empty secret rather than disabling redaction", () => {
+    expect(() => createStreamingSecretRedactor("", () => {})).toThrow(/secret/);
+  });
+});
 
 describe("Qoder runtime machine source", () => {
   it("accepts direct-only machine ID and rejects direct plus file ambiguity", () => {
@@ -217,6 +254,10 @@ describe("Qoder runtime manager lease lifecycle", () => {
     expect(diagnosticLog).not.toContain(lease.token);
     expect((await stat(logPath)).mode & 0o077).toBe(0);
     expect((await stat(logPath)).size).toBeLessThanOrEqual(262144);
+    const logFiles = await readdir(fake.directory);
+    for (const file of logFiles.filter((entry) => entry.startsWith("qoder-proxy.stderr.log"))) {
+      expect(await readFile(join(fake.directory, file), "utf8")).not.toContain(lease.token);
+    }
     expect(diagnosticLog.length).toBeGreaterThan(0);
   });
 
