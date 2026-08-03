@@ -6,6 +6,7 @@ import { QoderRuntimeManager, runRuntimeCommand } from "../src/runtime-manager.t
 import { CatalogUpstreamError, type AuthSession, type ModelCatalogSnapshot } from "../src/auth/session.ts";
 import { QoderModelUnavailableError } from "../src/model-registry.ts";
 import { runCli } from "../src/cli.ts";
+import { createApp, type SessionLike } from "../src/proxy.ts";
 
 const managers: QoderRuntimeManager[] = [];
 const roots: string[] = [];
@@ -14,7 +15,7 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function fakeProxy(mode: "ok" | "missing" | "catalog" | "catalog500" | "startup-missing" | "startup-catalog" | "exit"): Promise<{ root: string; bin: string; machine: string; error: string }> {
+async function fakeProxy(mode: "ok" | "identity" | "missing" | "catalog" | "catalog500" | "startup-missing" | "startup-catalog" | "exit"): Promise<{ root: string; bin: string; machine: string; error: string }> {
   const root = await mkdtemp(join(tmpdir(), "qoder-readiness-")); roots.push(root);
   const bin = join(root, "qoder-proxy"); const machine = join(root, "machine_id"); const error = join(root, "startup-error.json");
   await writeFile(machine, "machine\n", { mode: 0o600 });
@@ -35,7 +36,9 @@ const server = Bun.serve({ hostname: "127.0.0.1", port, fetch(request) {
     if (mode === "missing") return new Response(null, { status: 404 });
     if (mode === "catalog") return new Response(null, { status: 502 });
     if (mode === "catalog500") return new Response(null, { status: 500 });
-    return Response.json({ ok: true, routingKey: process.env.QODER_CN_INFER_MODEL_KEY });
+    const routingKey = process.env.QODER_CN_INFER_MODEL_KEY;
+    const displayName = mode === "identity" ? "Qwen3.7-Plus" : routingKey === "qmodel_38max" ? "Qwen3.8-Max" : routingKey === "qmodel_latest" ? "Qwen3.7-Max" : "Qwen3.6-Flash";
+    return Response.json({ ok: true, routingKey, displayName });
   }
   return new Response(null, { status: 404 });
 }});
@@ -49,7 +52,7 @@ function envFor(fixture: Awaited<ReturnType<typeof fakeProxy>>, socket: string) 
 }
 
 describe("runtime readiness fail-fast", () => {
-  it.each([["missing", "Qoder runtime model unavailable", "qmodel_38max"], ["catalog", "Qoder model catalog unavailable", undefined], ["catalog500", "Qoder model catalog unavailable", undefined], ["startup-missing", "Qoder runtime model unavailable", "qmodel_38max"], ["startup-catalog", "Qoder model catalog unavailable", undefined], ["exit", "readiness 前退出", undefined]] as const)("maps %s without waiting for the full timeout", async (mode, message, routingKey) => {
+  it.each([["identity", "Qoder runtime model unavailable", "qmodel_38max"], ["missing", "Qoder runtime model unavailable", "qmodel_38max"], ["catalog", "Qoder model catalog unavailable", undefined], ["catalog500", "Qoder model catalog unavailable", undefined], ["startup-missing", "Qoder runtime model unavailable", "qmodel_38max"], ["startup-catalog", "Qoder model catalog unavailable", undefined], ["exit", "readiness 前退出", undefined]] as const)("maps %s without waiting for the full timeout", async (mode, message, routingKey) => {
     const fixture = await fakeProxy(mode);
     const manager = new QoderRuntimeManager(envFor(fixture, join(fixture.root, "runtime.sock")));
     managers.push(manager); await manager.listen();
@@ -71,6 +74,7 @@ describe("runtime readiness fail-fast", () => {
 
   it.each([
     ["missing", "model-unavailable", "qmodel_38max"],
+    ["identity", "model-unavailable", "qmodel_38max"],
     ["catalog", "catalog-unavailable", undefined],
   ] as const)("preserves structured %s failure for the runtime wrapper", async (mode, code, routingKey) => {
     const fixture = await fakeProxy(mode);
@@ -81,9 +85,19 @@ describe("runtime readiness fail-fast", () => {
   });
 });
 
+describe("model routing identity endpoint", () => {
+  it("rejects a present key whose display name drifts", async () => {
+    const session = { listModels: async () => ({ generation: 3, models: [{ key: "qmodel_latest", displayName: "Qwen3.7-Plus" }] }) } as unknown as SessionLike;
+    const response = await createApp({ QODER_PROXY_API_KEY: "test-key", QODER_CN_INFER_MODEL_KEY: "qmodel_latest" }, session).request("/internal/model-routing", { headers: { authorization: "Bearer test-key" } });
+    expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({ error: { message: "runtime routing model identity unavailable" } });
+  });
+});
+
 describe("serve model preflight", () => {
   it.each([
     ["missing", new QoderModelUnavailableError("qmodel_38max"), { code: "model-unavailable", routingKey: "qmodel_38max" }],
+    ["identity", new QoderModelUnavailableError("qmodel_38max", "identity-mismatch"), { code: "model-unavailable", routingKey: "qmodel_38max" }],
     ["catalog", new CatalogUpstreamError("upstream unavailable", 502), { code: "catalog-unavailable", status: 502 }],
   ] as const)("writes a protected %s startup error and never binds", async (_name, failure, expected) => {
     const root = await mkdtemp(join(tmpdir(), "qoder-cli-preflight-")); roots.push(root);

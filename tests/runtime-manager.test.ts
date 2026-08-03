@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
 import { QoderRuntimeManager, runRuntimeCommand } from "../src/runtime-manager.ts";
+import { QODER_TIER_REGISTRY } from "../src/model-registry.ts";
 import { resolveMachineIdSource } from "../src/machine-id.ts";
 
 const managers: QoderRuntimeManager[] = [];
@@ -36,7 +37,11 @@ const server = Bun.serve({
     const pathname = new URL(request.url).pathname;
     if (request.headers.get("authorization") !== "Bearer " + token) return new Response(null, { status: 401 });
     if (pathname === "/internal/quota") return Response.json({ percentage: 12, pid: process.pid });
-    if (pathname === "/internal/model-routing") return Response.json({ ok: true, routingKey: process.env.QODER_CN_INFER_MODEL_KEY });
+    if (pathname === "/internal/model-routing") {
+      const routingKey = process.env.QODER_CN_INFER_MODEL_KEY!;
+      const displayName = routingKey === "qmodel_38max" ? "Qwen3.8-Max" : routingKey === "qmodel_latest" ? "Qwen3.7-Max" : routingKey === "q36fmodel" ? "Qwen3.6-Flash" : undefined;
+      return Response.json({ ok: true, routingKey, displayName });
+    }
     return new Response(null, { status: 404 });
   },
 });

@@ -10,6 +10,7 @@ import { convertAnthropicToCnBody, ConversionError, validateAnthropicRequestEnve
 import { emitAnthropicSseStream, collectAnthropicMessage } from "./sse.ts";
 import { AuthSession, CatalogUpstreamError, QuotaUpstreamError, StaleModelCatalogError, type ModelCatalogSnapshot, type QoderQuotaUsage, type SignedAttempt } from "./auth/session.ts";
 import { findModelById, ModelPaginationError, paginateModels, toAnthropicModelInfo, type QoderAssistantModel } from "./models.ts";
+import { hasExpectedModelIdentity } from "./model-registry.ts";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const ANTHROPIC_VERSION = "2023-06-01";
@@ -240,10 +241,14 @@ export function createApp(env: Record<string, string | undefined> = process.env,
     if (!routingKey) return c.json(apiError("api_error", "runtime routing key is not configured"), 500);
     try {
       const snapshot = await authSession.listModels(c.req.raw.signal);
-      if (!findModelById(snapshot.models, routingKey)) {
+      const target = findModelById(snapshot.models, routingKey);
+      if (!target) {
         return c.json(apiError("not_found_error", "runtime routing key unavailable"), 404);
       }
-      return c.json({ ok: true, routingKey, generation: snapshot.generation });
+      if (!hasExpectedModelIdentity(target, routingKey)) {
+        return c.json(apiError("not_found_error", "runtime routing model identity unavailable"), 404);
+      }
+      return c.json({ ok: true, routingKey, displayName: target.displayName, generation: snapshot.generation });
     } catch (error) {
       return catalogFailure(c, error);
     }

@@ -6,7 +6,7 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { dirname, join } from "node:path";
 import { request as httpRequest } from "node:http";
 import { readMachineIdFile, resolveMachineIdSource } from "./machine-id.ts";
-import { QODER_TIER_REGISTRY, QoderModelCatalogUnavailableError, QoderModelUnavailableError, type QoderTier } from "./model-registry.ts";
+import { hasExpectedModelIdentity, QODER_TIER_REGISTRY, QoderModelCatalogUnavailableError, QoderModelUnavailableError, type QoderTier } from "./model-registry.ts";
 export { QODER_TIER_REGISTRY } from "./model-registry.ts";
 export type { QoderTier } from "./model-registry.ts";
 
@@ -96,7 +96,14 @@ async function waitReady(baseUrl: string, token: string, child: ChildProcess, st
     try {
       if ((await requestStatus(`${baseUrl}/internal/quota`, token)).status !== 200) throw new Error("quota readiness failed");
       const routing = await requestStatus(`${baseUrl}/internal/model-routing`, token);
-      if (routing.status === 200) return;
+      if (routing.status === 200) {
+        let body: { routingKey?: unknown; displayName?: unknown };
+        try { body = JSON.parse(routing.body) as { routingKey?: unknown; displayName?: unknown }; } catch { throw new Error("model routing readiness 响应无效"); }
+        if (body.routingKey !== routingKey || typeof body.displayName !== "string" || !hasExpectedModelIdentity({ key: routingKey, displayName: body.displayName }, routingKey)) {
+          throw new QoderModelUnavailableError(routingKey, "identity-mismatch");
+        }
+        return;
+      }
       if (routing.status === 404) throw new QoderModelUnavailableError(routingKey);
       if (routing.status === 500 || routing.status === 502) throw new QoderModelCatalogUnavailableError();
       throw new Error(`model routing readiness failed: ${routing.status}`);

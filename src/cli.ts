@@ -11,7 +11,7 @@ import { logger } from "./logger.ts";
 import { createRoutingAttestation } from "./attestation.ts";
 import type { RoutingAttestation } from "./attestation.ts";
 import { runRuntimeCommand } from "./runtime-manager.ts";
-import { QoderModelUnavailableError } from "./model-registry.ts";
+import { hasExpectedModelIdentity, QoderModelUnavailableError } from "./model-registry.ts";
 
 const DEFAULT_PREFLIGHT_RETRY_MS = 1_000;
 const DEFAULT_SHUTDOWN_DRAIN_MS = 5_000;
@@ -187,7 +187,9 @@ export async function runCli(
       if (routingKey !== undefined && routingKey.length > 0) {
         try {
           const snapshot = await session.listModels(signal);
-          if (!snapshot.models.some((model) => model.key === routingKey)) throw new QoderModelUnavailableError(routingKey);
+          const target = snapshot.models.find((model) => model.key === routingKey);
+          if (!target) throw new QoderModelUnavailableError(routingKey, "missing");
+          if (!hasExpectedModelIdentity(target, routingKey)) throw new QoderModelUnavailableError(routingKey, "identity-mismatch");
         } catch (error) {
           if (error instanceof QoderModelUnavailableError) throw error;
           if (error instanceof CatalogUpstreamError) throw error;
