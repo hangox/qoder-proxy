@@ -1,7 +1,7 @@
 // Qoder session runtime manager：代理与临时认证只存在 daemon 内存中。
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { request as httpRequest } from "node:http";
@@ -13,7 +13,8 @@ export type { QoderTier } from "./model-registry.ts";
 export type RuntimeEnv = Record<string, string | undefined>;
 export type RuntimeIo = { stdout(value: string): void; stderr(value: string): void };
 type RuntimeRequest = { op: "acquire" | "release" | "shutdown" | "ping" | "status"; runId?: string; ownerPid?: number; leaseId?: string; tier?: string };
-type RuntimeResponse = { ok: true; active?: boolean; runId?: string; ownerPid?: number; leaseId?: string; baseUrl?: string; socketPath?: string; token?: string; released?: boolean; tier?: QoderTier; routingKey?: string } | { ok: false; error: string; code?: "model-unavailable" | "catalog-unavailable" | "startup-failed"; routingKey?: string };
+type RuntimeDiagnostics = { stderrPath: string; maxBytes: number; rotationFiles: number };
+type RuntimeResponse = { ok: true; active?: boolean; runId?: string; ownerPid?: number; leaseId?: string; baseUrl?: string; socketPath?: string; token?: string; released?: boolean; tier?: QoderTier; routingKey?: string; diagnostics?: RuntimeDiagnostics } | { ok: false; error: string; code?: "model-unavailable" | "catalog-unavailable" | "startup-failed"; routingKey?: string };
 type Lease = { runId: string; token: string; leaseId: string; tier: QoderTier; baseUrl: string; child: ChildProcess; owners: Set<number>; invalid: boolean };
 const QODER_RUNTIME_STATUS_SCHEMA = "qoder-runtime/status/v1";
 function tierValue(value: unknown): QoderTier {
@@ -28,7 +29,33 @@ const READY_TIMEOUT_MS = 20_000;
 const MAX_FRAME_BYTES = 16 * 1024;
 const CLIENT_TIMEOUT_MS = 2_000;
 const IDLE_TIMEOUT_MS = 3_000;
+const RUNTIME_LOG_MAX_BYTES = 256 * 1024;
+const RUNTIME_LOG_ROTATIONS = 3;
 const DEFAULT_REAPER_MS = 500;
+function runtimeLogPath(env: RuntimeEnv): string { return join(runtimeDirectory(env), "qoder-proxy.stderr.log"); }
+function appendRuntimeStderr(env: RuntimeEnv, chunk: Buffer | string, secret?: string): void {
+  const path = runtimeLogPath(env);
+  try {
+    const directory = runtimeDirectory(env);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    chmodSync(directory, 0o700);
+    const raw = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
+    if (raw.length === 0) return;
+    const sanitized = secret ? raw.toString("utf8").split(secret).join("[redacted]") : raw.toString("utf8");
+    const safe = Buffer.from(sanitized, "utf8");
+    const text = safe.length > RUNTIME_LOG_MAX_BYTES ? safe.subarray(safe.length - RUNTIME_LOG_MAX_BYTES) : safe;
+    if (existsSync(path) && statSync(path).size + text.length > RUNTIME_LOG_MAX_BYTES) {
+      for (let index = RUNTIME_LOG_ROTATIONS - 1; index >= 1; index--) {
+        const source = `${path}.${index}`;
+        const target = `${path}.${index + 1}`;
+        if (existsSync(source)) { if (index === RUNTIME_LOG_ROTATIONS - 1) unlinkSync(source); else renameSync(source, target); }
+      }
+      if (existsSync(path)) renameSync(path, `${path}.1`);
+    }
+    appendFileSync(path, text, { mode: 0o600 });
+    chmodSync(path, 0o600);
+  } catch {}
+}
 function reaperIntervalMs(env: RuntimeEnv): number {
   const parsed = Number(env.QODER_RUNTIME_REAPER_MS);
   return Number.isInteger(parsed) && parsed >= 50 && parsed <= 60_000 ? parsed : DEFAULT_REAPER_MS;
@@ -189,7 +216,8 @@ export class QoderRuntimeManager {
     const startupErrorPath = join(runtimeDirectory(this.env), `startup-error-${leaseId}.json`);
     childEnv.QODER_PROXY_STARTUP_ERROR_FILE = startupErrorPath;
     try { unlinkSync(startupErrorPath); } catch {}
-    const child = spawn(command.command, command.args, { cwd: command.cwd, detached: false, stdio: "ignore", env: childEnv });
+    const child = spawn(command.command, command.args, { cwd: command.cwd, detached: false, stdio: ["ignore", "ignore", "pipe"], env: childEnv });
+    child.stderr?.on("data", (chunk: Buffer) => appendRuntimeStderr(this.env, chunk, token));
     const lease: Lease = { runId, token, leaseId, tier, baseUrl: `http://127.0.0.1:${port}`, child, owners: new Set([ownerPid]), invalid: false }; this.leases.set(runId, lease);
     child.once("exit", () => {
       lease.invalid = true;
@@ -291,7 +319,7 @@ export class QoderRuntimeManager {
         if (!validRunId(request.runId) || !validOwnerPid(request.ownerPid) || typeof request.leaseId !== "string") throw new Error("非法 runtime run/owner/lease");
         const lease = this.leases.get(request.runId);
         const active = !!lease && !lease.invalid && lease.leaseId === request.leaseId && lease.owners.has(request.ownerPid) && alive(request.ownerPid);
-        socket.end(JSON.stringify({ schema: QODER_RUNTIME_STATUS_SCHEMA, ok: true, active, runId: request.runId, ownerPid: request.ownerPid, leaseId: request.leaseId, baseUrl: active ? lease?.baseUrl : undefined, socketPath: socketPath(this.env) }) + "\n"); return;
+        socket.end(JSON.stringify({ schema: QODER_RUNTIME_STATUS_SCHEMA, ok: true, active, runId: request.runId, ownerPid: request.ownerPid, leaseId: request.leaseId, baseUrl: active ? lease?.baseUrl : undefined, socketPath: socketPath(this.env), diagnostics: { stderrPath: runtimeLogPath(this.env), maxBytes: RUNTIME_LOG_MAX_BYTES, rotationFiles: RUNTIME_LOG_ROTATIONS } }) + "\n"); return;
       }
       if (request.op === "acquire") { const result = await this.acquire(request.runId || "", request.ownerPid || 0, tierValue(request.tier)); socket.end(JSON.stringify({ ok: true, ...result }) + "\n"); return; }
       if (request.op === "release") { this.release(request.runId || "", request.ownerPid || 0, request.leaseId); socket.end(JSON.stringify({ ok: true, released: true, runId: request.runId, ownerPid: request.ownerPid, leaseId: request.leaseId, socketPath: socketPath(this.env) }) + "\n"); return; }
@@ -347,6 +375,6 @@ export async function runRuntimeCommand(args: string[], env: RuntimeEnv = proces
     throw error;
   }
   if (command === "acquire") io.stdout(`${JSON.stringify({ runId: response.runId, leaseId: response.leaseId, baseUrl: response.baseUrl, socketPath: response.socketPath, token: response.token, tier: response.tier, routingKey: response.routingKey })}\n`);
-  else if (command === "status") io.stdout(`${JSON.stringify({ active: response.active === true, runId: response.runId, ownerPid: response.ownerPid, leaseId: response.leaseId, baseUrl: response.baseUrl, socketPath: response.socketPath })}\n`);
+  else if (command === "status") io.stdout(`${JSON.stringify({ active: response.active === true, runId: response.runId, ownerPid: response.ownerPid, leaseId: response.leaseId, baseUrl: response.baseUrl, socketPath: response.socketPath, diagnostics: response.diagnostics })}\n`);
   else if (command === "release") io.stdout(`${JSON.stringify({ released: response.released === true, runId: response.runId, ownerPid: response.ownerPid, leaseId: response.leaseId, socketPath: response.socketPath })}\n`);
 }

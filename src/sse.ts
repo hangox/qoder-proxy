@@ -1,6 +1,19 @@
 // CN legacy SSE 帧解析 + Anthropic SSE 发射 / 非流式收集。
 
+import { createHash } from "node:crypto";
+import { logger } from "./logger.ts";
+
 export const MAX_PARALLEL_TOOLS = 2;
+export type SseExitTelemetry = { exitPath: string; errorClass?: string; errorHash?: string; finishReason?: string; doneObserved: boolean; finishEventObserved: boolean; blockCount: number; toolCallCount: number };
+function errorHash(error: unknown): string {
+  const name = error instanceof Error ? error.name : "Error";
+  const message = error instanceof Error ? error.message : String(error);
+  return createHash("sha256").update(`${name}:${message}`).digest("hex").slice(0, 16);
+}
+function recordSseExit(telemetry: SseExitTelemetry): void {
+  logger.info("SSE 流终态", { ...telemetry, errorHash: telemetry.errorHash });
+}
+
 const MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 
 export class SseProtocolError extends Error {}
@@ -225,6 +238,12 @@ export function emitAnthropicSseStream(cnBody: ReadableStream<Uint8Array> | null
   const encoder = new TextEncoder();
   let cancelled = false;
   let completionReported = false;
+  let telemetryReported = false;
+  const record = (exitPath: string, error?: unknown, state?: TerminalState, blockCount = 0, toolCallCount = 0) => {
+    if (telemetryReported) return;
+    telemetryReported = true;
+    recordSseExit({ exitPath, errorClass: error instanceof Error ? error.name : error ? "Error" : undefined, errorHash: error ? errorHash(error) : undefined, finishReason: state?.finishReason, doneObserved: state?.doneObserved ?? false, finishEventObserved: state?.finishEventObserved ?? false, blockCount, toolCallCount });
+  };
   const reportCompletion = (completed: boolean) => {
     if (!completionReported) { completionReported = true; onCompleted?.(completed); }
   };
@@ -234,10 +253,10 @@ export function emitAnthropicSseStream(cnBody: ReadableStream<Uint8Array> | null
       const close = () => { if (!closed) { closed = true; try { controller.close(); } catch {} } };
       const emit = (event: string, data: unknown) => { if (!closed && !cancelled) controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)); };
       const abort = () => cancelled || signal?.aborted;
-      if (abort()) { reportCompletion(false); close(); return; }
+      if (abort()) { record("aborted-before-start"); reportCompletion(false); close(); return; }
       emit("message_start", { type: "message_start", message: { id: messageId, type: "message", role: "assistant", content: [], model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
-      if (!cnBody) { emit("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } }); emit("message_stop", { type: "message_stop" }); reportCompletion(true); close(); return; }
-      let contentIndex = 0, textOpen = false, errored = false, semanticChoiceIndex: number | undefined, usage: LegacyUsage | undefined;
+      if (!cnBody) { emit("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } }); emit("message_stop", { type: "message_stop" }); record("empty-upstream-success"); reportCompletion(true); close(); return; }
+      let contentIndex = 0, textOpen = false, errored = false, semanticChoiceIndex: number | undefined, usage: LegacyUsage | undefined, errorPath = "";
       const terminal: TerminalState = { doneObserved: false, finishEventObserved: false };
       const calls = new Map<string, CompletedToolCall>();
       const closeText = () => { if (textOpen) { emit("content_block_stop", { type: "content_block_stop", index: contentIndex++ }); textOpen = false; } };
@@ -247,57 +266,64 @@ export function emitAnthropicSseStream(cnBody: ReadableStream<Uint8Array> | null
           const frame = parseLegacyFrame(wire.event, wire.data);
           const phase = advanceTerminalState(frame, terminal);
           if (phase === "bookkeeping" || frame.kind === "done") continue;
-          if (frame.kind === "error") { closeText(); emit("error", { type: "error", error: { type: "api_error", message: "upstream error" } }); errored = true; break; }
+          if (frame.kind === "error") { closeText(); emit("error", { type: "error", error: { type: "api_error", message: "upstream error" } }); errorPath = "upstream-error-frame"; errored = true; break; }
           if (phase === "usage") { usage = usage ? { ...usage, ...frame.usage } : frame.usage; continue; }
           if (frame.semanticChoiceIndex !== undefined) {
             if (semanticChoiceIndex !== undefined && frame.semanticChoiceIndex !== semanticChoiceIndex) throw new SseProtocolError("legacy SSE semantic choice index 发生变化");
             semanticChoiceIndex = frame.semanticChoiceIndex;
           }
           if (frame.contentDelta) { if (!textOpen) { emit("content_block_start", { type: "content_block_start", index: contentIndex, content_block: { type: "text", text: "" } }); textOpen = true; } emit("content_block_delta", { type: "content_block_delta", index: contentIndex, delta: { type: "text_delta", text: frame.contentDelta } }); }
-          try { aggregateToolCallDeltas(frame.toolCallDeltas, calls); } catch { closeText(); emit("error", { type: "error", error: { type: "api_error", message: "tool_call 聚合失败" } }); errored = true; break; }
-          if (calls.size > MAX_PARALLEL_TOOLS) { closeText(); emit("error", { type: "error", error: { type: "api_error", message: `并行工具超过上限 ${MAX_PARALLEL_TOOLS}` } }); errored = true; break; }
+          try { aggregateToolCallDeltas(frame.toolCallDeltas, calls); } catch (error) { closeText(); emit("error", { type: "error", error: { type: "api_error", message: "tool_call 聚合失败" } }); errorPath = "tool-call-aggregate-error"; errored = true; break; }
+          if (calls.size > MAX_PARALLEL_TOOLS) { closeText(); emit("error", { type: "error", error: { type: "api_error", message: `并行工具超过上限 ${MAX_PARALLEL_TOOLS}` } }); errorPath = "tool-call-limit"; errored = true; break; }
           if (frame.usage) usage = usage ? { ...usage, ...frame.usage } : frame.usage;
           if (phase === "semantic-finish") {
             closeText();
-            if (calls.size > 0 && terminal.finishReason !== "tool_calls") { emit("error", { type: "error", error: { type: "api_error", message: "tool_call 缺少 finish_reason=tool_calls" } }); errored = true; break; }
-            if (terminal.finishReason === "tool_calls" && calls.size === 0) { emit("error", { type: "error", error: { type: "api_error", message: "finish_reason=tool_calls 但没有 tool_call" } }); errored = true; break; }
+            if (calls.size > 0 && terminal.finishReason !== "tool_calls") { emit("error", { type: "error", error: { type: "api_error", message: "tool_call 缺少 finish_reason=tool_calls" } }); errorPath = "tool-call-finish-reason"; errored = true; break; }
+            if (terminal.finishReason === "tool_calls" && calls.size === 0) { emit("error", { type: "error", error: { type: "api_error", message: "finish_reason=tool_calls 但没有 tool_call" } }); errorPath = "empty-tool-call-finish"; errored = true; break; }
           }
         }
-      } catch {
-        if (!abort()) { closeText(); emit("error", { type: "error", error: { type: "api_error", message: "proxy stream error" } }); errored = true; }
+      } catch (error) {
+        if (!abort()) { closeText(); emit("error", { type: "error", error: { type: "api_error", message: "proxy stream error" } }); errorPath = "parser-or-protocol-error"; errored = true; }
       }
-      if (!errored && !abort() && !terminal.doneObserved && terminal.finishReason === undefined) { closeText(); emit("error", { type: "error", error: { type: "api_error", message: "upstream stream truncated" } }); errored = true; }
-      if (!errored && !abort() && calls.size > 0 && terminal.finishReason !== "tool_calls") { closeText(); emit("error", { type: "error", error: { type: "api_error", message: "tool_call 缺少 finish_reason=tool_calls" } }); errored = true; }
+      if (!errored && !abort() && !terminal.doneObserved && terminal.finishReason === undefined) { closeText(); emit("error", { type: "error", error: { type: "api_error", message: "upstream stream truncated" } }); errorPath = "truncated"; errored = true; }
+      if (!errored && !abort() && calls.size > 0 && terminal.finishReason !== "tool_calls") { closeText(); emit("error", { type: "error", error: { type: "api_error", message: "tool_call 缺少 finish_reason=tool_calls" } }); errorPath = "tool-call-finish-reason"; errored = true; }
       if (!errored && !abort() && terminal.finishReason === "tool_calls") {
         for (const call of [...calls.values()].sort((a, b) => a.choiceIndex - b.choiceIndex || a.index - b.index)) {
           let final: { id: string; name: string; argumentsJson: string };
-          try { final = finalizeToolCall(call); } catch { emit("error", { type: "error", error: { type: "api_error", message: "tool_call 缺少 id/name 或 arguments 非法" } }); errored = true; break; }
+          try { final = finalizeToolCall(call); } catch (error) { emit("error", { type: "error", error: { type: "api_error", message: "tool_call 缺少 id/name 或 arguments 非法" } }); errorPath = "tool-call-finalize-error"; errored = true; break; }
           emit("content_block_start", { type: "content_block_start", index: contentIndex, content_block: { type: "tool_use", id: final.id, name: final.name, input: {} } });
           emit("content_block_delta", { type: "content_block_delta", index: contentIndex, delta: { type: "input_json_delta", partial_json: final.argumentsJson } });
           emit("content_block_stop", { type: "content_block_stop", index: contentIndex++ });
         }
       }
-      if (!errored && !abort()) { closeText(); emit("message_delta", { type: "message_delta", delta: { stop_reason: mapStopReason(terminal.finishReason), stop_sequence: null }, usage: mapUsage(usage) }); emit("message_stop", { type: "message_stop" }); reportCompletion(true); }
-      else reportCompletion(false);
+      if (!errored && !abort()) { closeText(); emit("message_delta", { type: "message_delta", delta: { stop_reason: mapStopReason(terminal.finishReason), stop_sequence: null }, usage: mapUsage(usage) }); emit("message_stop", { type: "message_stop" }); record("success", undefined, terminal, contentIndex, calls.size); reportCompletion(true); }
+      else { const exitPath = abort() ? "aborted" : errorPath || "error"; record(exitPath, new Error(exitPath), terminal, contentIndex, calls.size); reportCompletion(false); }
       close();
     },
-    cancel() { cancelled = true; reportCompletion(false); abortUpstream?.(); },
+    cancel() { cancelled = true; record("aborted", new Error("aborted"), undefined, 0, 0); reportCompletion(false); abortUpstream?.(); },
   });
 }
 
 export type AnthropicMessageResult = { ok: true; message: Record<string, unknown> } | { ok: false; errorMessage: string };
+function collectErrorResult(message: string, error: unknown, terminal: TerminalState, calls: Map<string, CompletedToolCall>, blockCount: number, exitPath: string): AnthropicMessageResult {
+  recordSseExit({ exitPath, errorClass: error instanceof Error ? error.name : "Error", errorHash: errorHash(error), finishReason: terminal.finishReason, doneObserved: terminal.doneObserved, finishEventObserved: terminal.finishEventObserved, blockCount, toolCallCount: calls.size });
+  return { ok: false, errorMessage: message };
+}
 export async function collectAnthropicMessage(cnBody: ReadableStream<Uint8Array> | null, messageId: string, model: string, signal?: AbortSignal): Promise<AnthropicMessageResult> {
-  if (!cnBody) return { ok: true, message: { id: messageId, type: "message", role: "assistant", content: [], model, stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } };
+  if (!cnBody) {
+    recordSseExit({ exitPath: "empty-upstream-success", doneObserved: false, finishEventObserved: false, blockCount: 0, toolCallCount: 0 });
+    return { ok: true, message: { id: messageId, type: "message", role: "assistant", content: [], model, stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } };
+  }
   let text = "", semanticChoiceIndex: number | undefined, usage: LegacyUsage | undefined;
   const terminal: TerminalState = { doneObserved: false, finishEventObserved: false };
   const calls = new Map<string, CompletedToolCall>();
   try {
     for await (const wire of parseSseFrames(cnBody, signal)) {
-      if (signal?.aborted) return { ok: false, errorMessage: "aborted" };
+      if (signal?.aborted) return collectErrorResult("aborted", new Error("aborted"), terminal, calls, text ? 1 : 0, "aborted");
       const frame = parseLegacyFrame(wire.event, wire.data);
       const phase = advanceTerminalState(frame, terminal);
       if (phase === "bookkeeping" || frame.kind === "done") continue;
-      if (frame.kind === "error") return { ok: false, errorMessage: frame.message };
+      if (frame.kind === "error") return collectErrorResult(frame.message, new Error("upstream SSE error"), terminal, calls, text ? 1 : 0, "upstream-error-frame");
       if (phase === "usage") { usage = usage ? { ...usage, ...frame.usage } : frame.usage; continue; }
       if (frame.semanticChoiceIndex !== undefined) {
         if (semanticChoiceIndex !== undefined && frame.semanticChoiceIndex !== semanticChoiceIndex) throw new SseProtocolError("legacy SSE semantic choice index 发生变化");
@@ -305,17 +331,23 @@ export async function collectAnthropicMessage(cnBody: ReadableStream<Uint8Array>
       }
       if (frame.contentDelta) text += frame.contentDelta;
       aggregateToolCallDeltas(frame.toolCallDeltas, calls);
-      if (calls.size > MAX_PARALLEL_TOOLS) return { ok: false, errorMessage: `并行工具超过上限 ${MAX_PARALLEL_TOOLS}` };
+      if (calls.size > MAX_PARALLEL_TOOLS) return collectErrorResult(`并行工具超过上限 ${MAX_PARALLEL_TOOLS}`, new SseProtocolError("tool call limit"), terminal, calls, text ? 1 : 0, "tool-call-limit");
       if (frame.usage) usage = usage ? { ...usage, ...frame.usage } : frame.usage;
       if (phase === "semantic-finish") {
-        if (calls.size > 0 && terminal.finishReason !== "tool_calls") return { ok: false, errorMessage: "tool_call 缺少 finish_reason=tool_calls" };
-        if (terminal.finishReason === "tool_calls" && calls.size === 0) return { ok: false, errorMessage: "finish_reason=tool_calls 但没有 tool_call" };
+        if (calls.size > 0 && terminal.finishReason !== "tool_calls") return collectErrorResult("tool_call 缺少 finish_reason=tool_calls", new SseProtocolError("tool call finish reason"), terminal, calls, text ? 1 : 0, "tool-call-finish-reason");
+        if (terminal.finishReason === "tool_calls" && calls.size === 0) return collectErrorResult("finish_reason=tool_calls 但没有 tool_call", new SseProtocolError("empty tool call finish"), terminal, calls, text ? 1 : 0, "empty-tool-call-finish");
       }
     }
-  } catch (e) { return { ok: false, errorMessage: e instanceof Error ? e.message : "proxy stream error" }; }
-  if (!terminal.doneObserved && terminal.finishReason === undefined) return { ok: false, errorMessage: "upstream stream truncated" };
-  if (calls.size > 0 && terminal.finishReason !== "tool_calls") return { ok: false, errorMessage: "tool_call 缺少 finish_reason=tool_calls" };
+  } catch (error) {
+    return collectErrorResult(error instanceof Error ? error.message : "proxy stream error", error, terminal, calls, text ? 1 : 0, "parser-or-protocol-error");
+  }
+  if (!terminal.doneObserved && terminal.finishReason === undefined) return collectErrorResult("upstream stream truncated", new SseProtocolError("stream truncated"), terminal, calls, text ? 1 : 0, "truncated");
+  if (calls.size > 0 && terminal.finishReason !== "tool_calls") return collectErrorResult("tool_call 缺少 finish_reason=tool_calls", new SseProtocolError("tool call finish reason"), terminal, calls, text ? 1 : 0, "tool-call-finish-reason");
   const content: Array<Record<string, unknown>> = text ? [{ type: "text", text }] : [];
-  for (const call of [...calls.values()].sort((a, b) => a.choiceIndex - b.choiceIndex || a.index - b.index)) { try { const final = finalizeToolCall(call); content.push({ type: "tool_use", id: final.id, name: final.name, input: JSON.parse(final.argumentsJson) }); } catch (e) { return { ok: false, errorMessage: e instanceof Error ? e.message : "tool_call 非法" }; } }
+  for (const call of [...calls.values()].sort((a, b) => a.choiceIndex - b.choiceIndex || a.index - b.index)) {
+    try { const final = finalizeToolCall(call); content.push({ type: "tool_use", id: final.id, name: final.name, input: JSON.parse(final.argumentsJson) }); }
+    catch (error) { return collectErrorResult(error instanceof Error ? error.message : "tool_call 非法", error, terminal, calls, content.length, "tool-call-finalize-error"); }
+  }
+  recordSseExit({ exitPath: "success", finishReason: terminal.finishReason, doneObserved: terminal.doneObserved, finishEventObserved: terminal.finishEventObserved, blockCount: content.length, toolCallCount: calls.size });
   return { ok: true, message: { id: messageId, type: "message", role: "assistant", content, model, stop_reason: mapStopReason(terminal.finishReason), stop_sequence: null, usage: mapUsage(usage) } };
 }

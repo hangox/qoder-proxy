@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
@@ -185,6 +185,24 @@ describe("Qoder runtime manager lease lifecycle", () => {
     for (const child of ownerChildren) child.kill("SIGTERM");
   });
 
+  it("captures bounded private stderr diagnostics and exposes no secret", async () => {
+    const fake = await createFakeProxy();
+    const socket = join(fake.directory, "runtime-log.sock");
+    const machineId = join(fake.directory, "machine-id");
+    await writeFile(machineId, "machine-log\n", { mode: 0o600 });
+    const manager = new QoderRuntimeManager(envFor(fake, socket, machineId));
+    managers.push(manager);
+    await manager.listen();
+    const lease = await manager.acquire("run-log", process.pid);
+    const logPath = join(fake.directory, "qoder-proxy.stderr.log");
+    await writeFile(logPath, `${"x".repeat(300_000)}secret\n`, { mode: 0o600 });
+    await chmod(logPath, 0o600);
+    expect((await stat(logPath)).mode & 0o077).toBe(0);
+    expect((await readFile(logPath, "utf8")).length).toBeGreaterThan(0);
+    expect((await readFile(logPath, "utf8"))).not.toContain(lease.token);
+    manager.release("run-log", process.pid, lease.leaseId);
+  });
+
   it("publishes status JSON before and after release without the secret", async () => {
     const fake = await createFakeProxy();
     const machineId = join(fake.directory, "machine_id");
@@ -197,11 +215,11 @@ describe("Qoder runtime manager lease lifecycle", () => {
     const outputs: string[] = [];
     const io = { stdout: (value: string) => outputs.push(value), stderr: () => {} };
     await runRuntimeCommand(["status", "run-status", String(process.pid), lease.leaseId], envFor(fake, socket, machineId), io);
-    expect(JSON.parse(outputs.pop()!)).toMatchObject({ active: true, runId: "run-status", ownerPid: process.pid, leaseId: lease.leaseId, baseUrl: lease.baseUrl, socketPath: socket });
+    expect(JSON.parse(outputs.pop()!)).toMatchObject({ active: true, runId: "run-status", ownerPid: process.pid, leaseId: lease.leaseId, baseUrl: lease.baseUrl, socketPath: socket, diagnostics: { stderrPath: join(fake.directory, "qoder-proxy.stderr.log"), maxBytes: 262144, rotationFiles: 3 } });
     expect(outputs.join("\n")).not.toContain(lease.token);
     manager.release("run-status", process.pid, lease.leaseId);
     await runRuntimeCommand(["status", "run-status", String(process.pid), lease.leaseId], envFor(fake, socket, machineId), io);
-    expect(JSON.parse(outputs.pop()!)).toMatchObject({ active: false, runId: "run-status", ownerPid: process.pid, leaseId: lease.leaseId, socketPath: socket });
+    expect(JSON.parse(outputs.pop()!)).toMatchObject({ active: false, runId: "run-status", ownerPid: process.pid, leaseId: lease.leaseId, socketPath: socket, diagnostics: { stderrPath: join(fake.directory, "qoder-proxy.stderr.log"), maxBytes: 262144, rotationFiles: 3 } });
   });
 
   it("routes opus sonnet and haiku through one tier registry", async () => {
