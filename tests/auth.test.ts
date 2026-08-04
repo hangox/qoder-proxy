@@ -1624,8 +1624,15 @@ describe("reservation owner activity", () => {
 
 describe("createConfigStore (safe file store, no real credentials)", () => {
   let dir: string;
+  // 这个 describe 块里有多处 it()/it.each() 直接 `globalThis.fetch = vi.fn(...)`（capability/rotation 相关用例）
+  // 却始终没有对应的保存/恢复，导致这个进程级全局状态在整个 describe 结束后仍然是最后一次的 mock 实现，
+  // 会污染同一个 `bun test` 进程里之后运行的任何测试文件的真实 fetch() 调用（例如 runtime-gateway.test.ts
+  // 用真实网络请求验证 gateway 行为，如果撞见这个残留 mock 会得到该 mock 的固定/挂起返回值而不是真实响应）。
+  // 和文件里其它 5 个 describe 块一样的既有模式：保存一次、每个 it() 后统一恢复。
+  const originalFetch = globalThis.fetch;
 
   afterEach(async () => {
+    globalThis.fetch = originalFetch;
     if (dir) await rm(dir, { recursive: true, force: true });
   });
 
