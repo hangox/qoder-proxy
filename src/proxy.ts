@@ -7,7 +7,7 @@ import { logger } from "./logger.ts";
 import { createRoutingAttestation } from "./attestation.ts";
 import type { RoutingAttestation, RoutingAttestationSessionObserver, RoutingMessageLease } from "./attestation.ts";
 import { convertAnthropicToCnBody, ConversionError, validateAnthropicRequestEnvelope, type CnConversion } from "./convert.ts";
-import { emitAnthropicSseStream, collectAnthropicMessage } from "./sse.ts";
+import { emitAnthropicSseStream, emitAnthropicMessageSse, collectAnthropicMessage } from "./sse.ts";
 import { AuthSession, CatalogUpstreamError, QuotaUpstreamError, StaleModelCatalogError, type ModelCatalogSnapshot, type QoderQuotaUsage, type SignedAttempt } from "./auth/session.ts";
 import { findModelById, ModelPaginationError, paginateModels, toAnthropicModelInfo, type QoderAssistantModel } from "./models.ts";
 import { expectedModelForRoutingKey, hasExpectedModelIdentity } from "./model-registry.ts";
@@ -378,6 +378,50 @@ export function createApp(env: Record<string, string | undefined> = process.env,
       }
       attempt.context.dispose();
       attempt = undefined;
+      const replayStream = anthropic.stream === true;
+      const parseBufferedToolResponse = async (body: ReadableStream<Uint8Array>): Promise<Awaited<ReturnType<typeof collectAnthropicMessage>>> => collectAnthropicMessage(body, messageId, resolvedModel.key, signal);
+      if (tools > 0) {
+        let result = await parseBufferedToolResponse(upstream.body);
+        if (!result.ok && result.retryable) {
+          attestation?.recordRetry();
+          try {
+            attempt = authSession.createSignedAttempt(bodyJson, resolvedModel.key, snapshot.generation);
+            attestation?.recordInference();
+            const retryUpstream = await fetch(attempt.prepared.url, { method: "POST", headers: attempt.prepared.headers, body: attempt.prepared.body ?? bodyJson, signal });
+            attempt.context.dispose();
+            attempt = undefined;
+            if (!retryUpstream.ok || !retryUpstream.body) {
+              const mapped = mapUpstreamStatus(retryUpstream.status);
+              await discard(retryUpstream);
+              finalizeAttestation(false);
+              return c.json(apiError(mapped.type, `upstream HTTP ${retryUpstream.status}`), mapped.httpStatus);
+            }
+            if (!isSse(retryUpstream)) {
+              await discard(retryUpstream);
+              finalizeAttestation(false);
+              return c.json(apiError("api_error", "upstream returned non-SSE response"), 502);
+            }
+            result = await parseBufferedToolResponse(retryUpstream.body);
+          } catch (error) {
+            finalizeAttestation(false);
+            if (signal.aborted) return c.json(apiError("api_error", "request aborted"), 500);
+            logger.error("工具响应重试失败", { errorClass: error instanceof Error ? error.name : "Error" });
+            return c.json(apiError("api_error", "tool call response validation failed; retry the request"), 503, { "x-should-retry": "true" });
+          }
+        }
+        if (!result.ok) {
+          finalizeAttestation(false);
+          if (result.retryable) {
+            return c.json(apiError("api_error", "tool call response validation failed; retry the request"), 503, { "x-should-retry": "true" });
+          }
+          return c.json(apiError("api_error", "upstream stream error"), 502);
+        }
+        finalizeAttestation(true);
+        if (replayStream) {
+          return new Response(emitAnthropicMessageSse(result.message), { headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } });
+        }
+        return c.json(result.message);
+      }
       if (anthropic.stream === true) {
         return new Response(emitAnthropicSseStream(upstream.body, messageId, resolvedModel.key, signal, () => requestController.abort(new Error("downstream cancelled")), finalizeAttestation), { headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } });
       }

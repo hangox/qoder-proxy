@@ -205,6 +205,67 @@ describe("proxy HTTP layer", () => {
     const response = await createApp(ENV, fakeSession()).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }) });
     expect(response.status).toBe(200); expect((await response.json()).content).toEqual([{ type: "text", text: "hi there" }]);
   });
+  it("buffers and replays a valid tool response as Anthropic SSE", async () => {
+    const toolResponse = [
+      frame({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "opaque-id", function: { name: "safe_tool", arguments: JSON.stringify({ ok: true }) } }] } }] }),
+      frame({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+      "event: message\ndata: {\"body\":\"[DONE]\"}\n\n",
+    ];
+    fetchMock.mockResolvedValueOnce(new Response(streamFrom(toolResponse), { status: 200, headers: { "content-type": "text/event-stream" } }));
+    const response = await createApp(ENV, fakeSession()).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ stream: true, tools: [{ name: "safe_tool", input_schema: { type: "object" } }], messages: [{ role: "user", content: "use the tool" }] }) });
+    const text = await response.text();
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    expect(text).toContain("event: message_start");
+    expect(text).toContain("event: content_block_start");
+    expect(text).toContain("safe_tool");
+    expect(text).toContain('"stop_reason":"tool_use"');
+    expect(text).toContain("event: message_stop");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+  it("buffers a valid non-stream tool response before returning JSON", async () => {
+    const toolResponse = [
+      frame({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "opaque-id", function: { name: "safe_tool", arguments: JSON.stringify({ ok: true }) } }] } }] }),
+      frame({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+    ];
+    fetchMock.mockResolvedValueOnce(new Response(streamFrom(toolResponse), { status: 200, headers: { "content-type": "text/event-stream" } }));
+    const response = await createApp(ENV, fakeSession()).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ tools: [{ name: "safe_tool", input_schema: { type: "object" } }], messages: [{ role: "user", content: "use the tool" }] }) });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ stop_reason: "tool_use", content: [{ type: "tool_use", name: "safe_tool", input: { ok: true } }] });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+  it("retries one malformed tool finalize response and replays the valid retry", async () => {
+    const malformed = [
+      frame({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "opaque-id", function: { name: "safe_tool", arguments: "{" } }] } }] }),
+      frame({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+    ];
+    const valid = [
+      frame({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "opaque-id-2", function: { name: "safe_tool", arguments: "{}" } }] } }] }),
+      frame({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+    ];
+    fetchMock
+      .mockResolvedValueOnce(new Response(streamFrom(malformed), { status: 200, headers: { "content-type": "text/event-stream" } }))
+      .mockResolvedValueOnce(new Response(streamFrom(valid), { status: 200, headers: { "content-type": "text/event-stream" } }));
+    const response = await createApp(ENV, fakeSession()).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ stream: true, tools: [{ name: "safe_tool", input_schema: { type: "object" } }], messages: [{ role: "user", content: "use the tool" }] }) });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("message_stop");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+  it("returns retryable JSON after two malformed tool finalize responses before any SSE", async () => {
+    const malformed = [
+      frame({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "opaque-id", function: { name: "safe_tool", arguments: "{" } }] } }] }),
+      frame({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+    ];
+    fetchMock
+      .mockResolvedValueOnce(new Response(streamFrom(malformed), { status: 200, headers: { "content-type": "text/event-stream" } }))
+      .mockResolvedValueOnce(new Response(streamFrom(malformed), { status: 200, headers: { "content-type": "text/event-stream" } }));
+    const response = await createApp(ENV, fakeSession()).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ stream: true, tools: [{ name: "safe_tool", input_schema: { type: "object" } }], messages: [{ role: "user", content: "use the tool" }] }) });
+    expect(response.status).toBe(503);
+    expect(response.headers.get("x-should-retry")).toBe("true");
+    expect(response.headers.get("content-type")).toContain("application/json");
+    expect(await response.text()).not.toContain("event: message_start");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
   it("maps non-2xx status", async () => {
     fetchMock.mockResolvedValueOnce(new Response("rate", { status: 429 }));
     const response = await createApp(ENV, fakeSession()).request("/v1/messages", { method: "POST", headers: HEADERS, body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }) });

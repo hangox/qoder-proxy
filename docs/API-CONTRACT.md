@@ -96,7 +96,11 @@
 ## 并行工具
 
 - 上限：`MAX_PARALLEL_TOOLS = 2`
-- 流式聚合阶段检测到超过 2 个并行 tool call 时发出 Anthropic `error` 事件并中断流
+- 含 `tools` 的请求先完整缓冲并验证上游 SSE；验证成功后，流式请求由代理回放已验证的 Anthropic SSE，非流式请求返回已验证 Message
+- 四类 tool finalize 格式错误（缺少 id、缺少 name、arguments 非法 JSON、arguments 非 object）最多由代理在尚未向客户端发送任何 SSE 前重试一次
+- 两次均失败时返回 HTTP 503 `api_error`，并带 `x-should-retry: true`；不发送部分或伪造的 SSE
+- 无 `tools` 请求保持原有流式路径
+- 聚合阶段检测到超过 2 个并行 tool call 时仍 fail-closed，不重试、不串行化、不丢弃第三个工具
 
 ## 模型目录获取与错误映射
 

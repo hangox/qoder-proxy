@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { parseSseFrames, parseLegacyFrame, SseProtocolError, emitAnthropicSseStream, collectAnthropicMessage } from "../src/sse.ts";
 
 function streamFromChunks(chunks: string[]): ReadableStream<Uint8Array> {
@@ -353,6 +353,33 @@ describe("emitAnthropicSseStream", () => {
     expect(text).toContain('"stop_reason":"tool_use"');
   });
 
+  it.each([
+    ["missing-id", { index: 0, function: { name: "safe_tool", arguments: "{}" } }],
+    ["missing-name", { index: 0, id: "opaque-id", function: { arguments: "{}" } }],
+    ["invalid-json", { index: 0, id: "opaque-id", function: { name: "safe_tool", arguments: "{" } }],
+    ["non-object", { index: 0, id: "opaque-id", function: { name: "safe_tool", arguments: "[]" } }],
+  ] as const)("emits structured safe telemetry for stream tool finalize failures: %s", async (reason, toolCall) => {
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const body = streamFromChunks([
+        envelopeFrame({ choices: [{ index: 0, delta: { tool_calls: [toolCall] } }] }),
+        envelopeFrame({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+      ]);
+      const { events, text } = await collectAnthropicEvents(body);
+      expect(events).toContain("message_start");
+      expect(events).toContain("error");
+      expect(events).not.toContain("message_stop");
+      expect(text).not.toContain("opaque-id");
+      expect(text).not.toContain("safe_tool");
+      const entry = JSON.parse(stderr.mock.calls.at(-1)?.[0] as string) as Record<string, unknown>;
+      expect(entry).toMatchObject({ exitPath: "tool-call-finalize-error", toolFinalizeReason: reason, toolChoiceIndex: 0, toolIndex: 0, toolArgumentBytes: expect.any(Number), toolFragmentCount: 1 });
+      expect(JSON.stringify(entry)).not.toContain("opaque-id");
+      expect(JSON.stringify(entry)).not.toContain("safe_tool");
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
   it.each([42, []])("rejects invalid event:finish root after stop and DONE: %j", async (payload) => {
     const body = streamFromChunks([
       envelopeFrame({ choices: [{ index: 0, delta: { content: "complete" } }] }),
@@ -449,6 +476,39 @@ describe("collectAnthropicMessage (non-streaming)", () => {
     const body = streamFromChunks([`event: error\ndata: ${JSON.stringify({ message: "boom" })}\n\n`]);
     const result = await collectAnthropicMessage(body, "msg_test", "claude-x");
     expect(result.ok).toBe(false);
+  });
+
+  it.each([
+    ["missing-id", { index: 0, function: { name: "safe_tool", arguments: "{}" } }],
+    ["missing-name", { index: 0, id: "opaque-id", function: { arguments: "{}" } }],
+    ["invalid-json", { index: 0, id: "opaque-id", function: { name: "safe_tool", arguments: "{" } }],
+    ["non-object", { index: 0, id: "opaque-id", function: { name: "safe_tool", arguments: "[]" } }],
+  ] as const)("classifies tool finalize failure safely: %s", async (reason, toolCall) => {
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const body = streamFromChunks([
+        envelopeFrame({ choices: [{ index: 0, delta: { tool_calls: [toolCall] } }] }),
+        envelopeFrame({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+      ]);
+      const result = await collectAnthropicMessage(body, "msg_test", "claude-x");
+      expect(result).toMatchObject({ ok: false, errorMessage: "tool_call 非法", exitPath: "tool-call-finalize-error", retryable: true });
+      const entry = JSON.parse(stderr.mock.calls.at(-1)?.[0] as string) as Record<string, unknown>;
+      expect(entry).toMatchObject({ exitPath: "tool-call-finalize-error", toolFinalizeReason: reason, toolChoiceIndex: 0, toolIndex: 0, toolArgumentBytes: expect.any(Number), toolFragmentCount: 1 });
+      expect(JSON.stringify(entry)).not.toContain("opaque-id");
+      expect(JSON.stringify(entry)).not.toContain("safe_tool");
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it("keeps a valid empty tool argument as an object", async () => {
+    const body = streamFromChunks([
+      envelopeFrame({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "opaque-id", function: { name: "safe_tool" } }] } }] }),
+      envelopeFrame({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+    ]);
+    const result = await collectAnthropicMessage(body, "msg_test", "claude-x");
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.message.content).toEqual([{ type: "tool_use", id: "opaque-id", name: "safe_tool", input: {} }]);
   });
 
   it.each([

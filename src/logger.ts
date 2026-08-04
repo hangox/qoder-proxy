@@ -9,7 +9,7 @@ const ALLOWED_FIELDS = new Set([
   "host", "route", "method", "durationMs", "port", "hostname",
   "truncated", "originalMaxTokens", "cnMaxTokens", "ignoredFields", "modelProvided",
   "toolCount", "reason", "attempt", "apiKeyPresent", "configDir", "via", "code",
-  "aborted", "timeoutMs", "messageId", "exitPath", "doneObserved", "finishEventObserved", "finishReason", "blockCount", "toolCallCount", "stderrPath", "maxBytes", "rotationFiles",
+  "aborted", "timeoutMs", "messageId", "exitPath", "doneObserved", "finishEventObserved", "finishReason", "blockCount", "toolCallCount", "stderrPath", "maxBytes", "rotationFiles", "toolFinalizeReason", "toolChoiceIndex", "toolIndex", "toolArgumentBytes", "toolFragmentCount",
 ]);
 
 function sanitizeFields(fields?: Record<string, unknown>): Record<string, unknown> | undefined {

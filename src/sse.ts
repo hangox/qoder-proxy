@@ -4,11 +4,22 @@ import { createHash } from "node:crypto";
 import { logger } from "./logger.ts";
 
 export const MAX_PARALLEL_TOOLS = 2;
-export type SseExitTelemetry = { exitPath: string; errorClass?: string; errorHash?: string; finishReason?: string; doneObserved: boolean; finishEventObserved: boolean; blockCount: number; toolCallCount: number };
-function errorHash(error: unknown): string {
+export class SseProtocolError extends Error {}
+export type ToolFinalizeReason = "missing-id" | "missing-name" | "invalid-json" | "non-object";
+export type SseExitTelemetry = { exitPath: string; errorClass?: string; errorHash?: string; finishReason?: string; doneObserved: boolean; finishEventObserved: boolean; blockCount: number; toolCallCount: number; toolFinalizeReason?: ToolFinalizeReason; toolChoiceIndex?: number; toolIndex?: number; toolArgumentBytes?: number; toolFragmentCount?: number };
+class ToolCallFinalizeError extends SseProtocolError {
+  constructor(public readonly reason: ToolFinalizeReason, public readonly choiceIndex: number, public readonly toolIndex: number, public readonly argumentBytes: number, public readonly fragmentCount: number) {
+    super("tool_call finalize failed");
+    this.name = "ToolCallFinalizeError";
+  }
+}
+function errorHash(error: unknown, exitPath?: string): string {
   const name = error instanceof Error ? error.name : "Error";
-  const message = error instanceof Error ? error.message : String(error);
+  const message = error instanceof ToolCallFinalizeError ? `tool-call-finalize:${error.reason}` : error instanceof SseProtocolError ? `sse-protocol:${exitPath ?? "unknown"}` : error instanceof Error ? error.message : String(error);
   return createHash("sha256").update(`${name}:${message}`).digest("hex").slice(0, 16);
+}
+function finalizeTelemetry(error: ToolCallFinalizeError): Pick<SseExitTelemetry, "toolFinalizeReason" | "toolChoiceIndex" | "toolIndex" | "toolArgumentBytes" | "toolFragmentCount"> {
+  return { toolFinalizeReason: error.reason, toolChoiceIndex: error.choiceIndex, toolIndex: error.toolIndex, toolArgumentBytes: error.argumentBytes, toolFragmentCount: error.fragmentCount };
 }
 function recordSseExit(telemetry: SseExitTelemetry): void {
   logger.info("SSE 流终态", { ...telemetry, errorHash: telemetry.errorHash });
@@ -16,7 +27,6 @@ function recordSseExit(telemetry: SseExitTelemetry): void {
 
 const MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 
-export class SseProtocolError extends Error {}
 export type WireFrame = { event: string; data: string };
 
 function stripField(line: string, prefix: string): string {
@@ -198,12 +208,13 @@ export function aggregateToolCallDeltas(deltas: ToolCallDeltaWithChoice[] | unde
   }
 }
 export function finalizeToolCall(call: CompletedToolCall): { id: string; name: string; argumentsJson: string } {
-  if (!call.id) throw new SseProtocolError(`完成态 tool_call 缺少非空 id: choiceIndex=${call.choiceIndex}, index=${call.index}`);
-  if (!call.name) throw new SseProtocolError(`完成态 tool_call 缺少非空 name: choiceIndex=${call.choiceIndex}, index=${call.index}`);
+  const argumentBytes = Buffer.byteLength(call.arguments, "utf8");
+  if (!call.id) throw new ToolCallFinalizeError("missing-id", call.choiceIndex, call.index, argumentBytes, call.fragmentCount);
+  if (!call.name) throw new ToolCallFinalizeError("missing-name", call.choiceIndex, call.index, argumentBytes, call.fragmentCount);
   if (!call.arguments) return { id: call.id, name: call.name, argumentsJson: "{}" };
   let parsed: unknown;
-  try { parsed = JSON.parse(call.arguments); } catch { throw new SseProtocolError(`完成态 tool_call arguments 非合法 JSON: ${call.id}`); }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new SseProtocolError(`完成态 tool_call arguments 不是 JSON object: ${call.id}`);
+  try { parsed = JSON.parse(call.arguments); } catch { throw new ToolCallFinalizeError("invalid-json", call.choiceIndex, call.index, argumentBytes, call.fragmentCount); }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new ToolCallFinalizeError("non-object", call.choiceIndex, call.index, argumentBytes, call.fragmentCount);
   return { id: call.id, name: call.name, argumentsJson: call.arguments };
 }
 function mapUsage(usage: LegacyUsage | undefined) { return { input_tokens: usage?.prompt_tokens ?? 0, output_tokens: usage?.completion_tokens ?? 0 }; }
@@ -242,7 +253,8 @@ export function emitAnthropicSseStream(cnBody: ReadableStream<Uint8Array> | null
   const record = (exitPath: string, error?: unknown, state?: TerminalState, blockCount = 0, toolCallCount = 0) => {
     if (telemetryReported) return;
     telemetryReported = true;
-    recordSseExit({ exitPath, errorClass: error instanceof Error ? error.name : error ? "Error" : undefined, errorHash: error ? errorHash(error) : undefined, finishReason: state?.finishReason, doneObserved: state?.doneObserved ?? false, finishEventObserved: state?.finishEventObserved ?? false, blockCount, toolCallCount });
+    const diagnostic = error instanceof ToolCallFinalizeError ? finalizeTelemetry(error) : {};
+    recordSseExit({ exitPath, errorClass: error instanceof Error ? error.name : error ? "Error" : undefined, errorHash: error ? errorHash(error, exitPath) : undefined, finishReason: state?.finishReason, doneObserved: state?.doneObserved ?? false, finishEventObserved: state?.finishEventObserved ?? false, blockCount, toolCallCount, ...diagnostic });
   };
   const reportCompletion = (completed: boolean) => {
     if (!completionReported) { completionReported = true; onCompleted?.(completed); }
@@ -256,7 +268,7 @@ export function emitAnthropicSseStream(cnBody: ReadableStream<Uint8Array> | null
       if (abort()) { record("aborted-before-start"); reportCompletion(false); close(); return; }
       emit("message_start", { type: "message_start", message: { id: messageId, type: "message", role: "assistant", content: [], model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
       if (!cnBody) { emit("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } }); emit("message_stop", { type: "message_stop" }); record("empty-upstream-success"); reportCompletion(true); close(); return; }
-      let contentIndex = 0, textOpen = false, errored = false, semanticChoiceIndex: number | undefined, usage: LegacyUsage | undefined, errorPath = "";
+      let contentIndex = 0, textOpen = false, errored = false, semanticChoiceIndex: number | undefined, usage: LegacyUsage | undefined, errorPath = "", terminalError: unknown;
       const terminal: TerminalState = { doneObserved: false, finishEventObserved: false };
       const calls = new Map<string, CompletedToolCall>();
       const closeText = () => { if (textOpen) { emit("content_block_stop", { type: "content_block_stop", index: contentIndex++ }); textOpen = false; } };
@@ -290,24 +302,60 @@ export function emitAnthropicSseStream(cnBody: ReadableStream<Uint8Array> | null
       if (!errored && !abort() && terminal.finishReason === "tool_calls") {
         for (const call of [...calls.values()].sort((a, b) => a.choiceIndex - b.choiceIndex || a.index - b.index)) {
           let final: { id: string; name: string; argumentsJson: string };
-          try { final = finalizeToolCall(call); } catch (error) { emit("error", { type: "error", error: { type: "api_error", message: "tool_call 缺少 id/name 或 arguments 非法" } }); errorPath = "tool-call-finalize-error"; errored = true; break; }
+          try { final = finalizeToolCall(call); } catch (error) { emit("error", { type: "error", error: { type: "api_error", message: "tool_call 非法" } }); errorPath = "tool-call-finalize-error"; terminalError = error; errored = true; break; }
           emit("content_block_start", { type: "content_block_start", index: contentIndex, content_block: { type: "tool_use", id: final.id, name: final.name, input: {} } });
           emit("content_block_delta", { type: "content_block_delta", index: contentIndex, delta: { type: "input_json_delta", partial_json: final.argumentsJson } });
           emit("content_block_stop", { type: "content_block_stop", index: contentIndex++ });
         }
       }
       if (!errored && !abort()) { closeText(); emit("message_delta", { type: "message_delta", delta: { stop_reason: mapStopReason(terminal.finishReason), stop_sequence: null }, usage: mapUsage(usage) }); emit("message_stop", { type: "message_stop" }); record("success", undefined, terminal, contentIndex, calls.size); reportCompletion(true); }
-      else { const exitPath = abort() ? "aborted" : errorPath || "error"; record(exitPath, new Error(exitPath), terminal, contentIndex, calls.size); reportCompletion(false); }
+      else { const exitPath = abort() ? "aborted" : errorPath || "error"; record(exitPath, terminalError ?? new Error(exitPath), terminal, contentIndex, calls.size); reportCompletion(false); }
       close();
     },
     cancel() { cancelled = true; record("aborted", new Error("aborted"), undefined, 0, 0); reportCompletion(false); abortUpstream?.(); },
   });
 }
 
-export type AnthropicMessageResult = { ok: true; message: Record<string, unknown> } | { ok: false; errorMessage: string };
+export type AnthropicMessageFailure = { ok: false; errorMessage: string; exitPath: string; retryable: boolean };
+export type AnthropicMessageResult = { ok: true; message: Record<string, unknown> } | AnthropicMessageFailure;
 function collectErrorResult(message: string, error: unknown, terminal: TerminalState, calls: Map<string, CompletedToolCall>, blockCount: number, exitPath: string): AnthropicMessageResult {
-  recordSseExit({ exitPath, errorClass: error instanceof Error ? error.name : "Error", errorHash: errorHash(error), finishReason: terminal.finishReason, doneObserved: terminal.doneObserved, finishEventObserved: terminal.finishEventObserved, blockCount, toolCallCount: calls.size });
-  return { ok: false, errorMessage: message };
+  const diagnostic = error instanceof ToolCallFinalizeError ? finalizeTelemetry(error) : {};
+  recordSseExit({ exitPath, errorClass: error instanceof Error ? error.name : "Error", errorHash: errorHash(error, exitPath), finishReason: terminal.finishReason, doneObserved: terminal.doneObserved, finishEventObserved: terminal.finishEventObserved, blockCount, toolCallCount: calls.size, ...diagnostic });
+  const result = { ok: false, errorMessage: error instanceof ToolCallFinalizeError ? "tool_call 非法" : message } as AnthropicMessageFailure;
+  Object.defineProperties(result, {
+    exitPath: { value: exitPath, enumerable: false },
+    retryable: { value: error instanceof ToolCallFinalizeError, enumerable: false },
+  });
+  return result;
+}
+
+export function emitAnthropicMessageSse(message: Record<string, unknown>): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  const events: string[] = [];
+  const emit = (event: string, data: unknown): void => { events.push(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
+  const content = Array.isArray(message.content) ? message.content : [];
+  emit("message_start", { type: "message_start", message: { id: message.id, type: "message", role: "assistant", content: [], model: message.model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+  let index = 0;
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const item = block as Record<string, unknown>;
+    if (item.type === "text" && typeof item.text === "string") {
+      emit("content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } });
+      emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: item.text } });
+      emit("content_block_stop", { type: "content_block_stop", index });
+      index++;
+    } else if (item.type === "tool_use" && typeof item.id === "string" && typeof item.name === "string") {
+      emit("content_block_start", { type: "content_block_start", index, content_block: { type: "tool_use", id: item.id, name: item.name, input: {} } });
+      emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(item.input ?? {}) } });
+      emit("content_block_stop", { type: "content_block_stop", index });
+      index++;
+    }
+  }
+  emit("message_delta", { type: "message_delta", delta: { stop_reason: message.stop_reason, stop_sequence: message.stop_sequence ?? null }, usage: message.usage ?? { input_tokens: 0, output_tokens: 0 } });
+  emit("message_stop", { type: "message_stop" });
+  return new ReadableStream<Uint8Array>({
+    start(controller) { for (const event of events) controller.enqueue(encoder.encode(event)); controller.close(); },
+  });
 }
 export async function collectAnthropicMessage(cnBody: ReadableStream<Uint8Array> | null, messageId: string, model: string, signal?: AbortSignal): Promise<AnthropicMessageResult> {
   if (!cnBody) {

@@ -43,9 +43,10 @@ message_stop
 |---|---|
 | CN SSE `event: error` 帧 | 关闭已打开文本块 → 发 `error` 事件（`api_error` / `"upstream error"`）→ 停止读取 |
 | 内层 chunk 携带 `error` 字段 | 同上，消息为 `"upstream chunk error"` |
-| tool_call 聚合阶段 `id` 冲突 | 发 `error` 事件（`"tool_call id 冲突"`）并 `controller.close()` |
-| tool_call 缺少 `id` / `name` | 发 `error` 事件（`"tool_call 缺少 id/name"`）并 `controller.close()` |
-| 并行 tool_call 超过上限 | 发 `error` 事件（`"并行工具超过上限 2"`）并 `controller.close()` |
+| tool_call 聚合阶段 `id` 冲突 | 发 `error` 事件并中断流；不重试 |
+| 聚合后 finalize 格式错误 | 内部细分为 `missing-id`、`missing-name`、`invalid-json`、`non-object`，仅写固定 reason、索引、参数字节数和 fragment 数，不记录 id/name/arguments |
+| 无 tools 的流式请求遇到错误 | 保持原有已发 SSE 的 `error` 事件路径 |
+| 含 tools 的请求 finalize 失败 | 在客户端收到任何 SSE 前重试一次；成功则回放完整已验证 Anthropic SSE |
+| 含 tools 的请求连续两次 finalize 失败 | 返回 HTTP 503 JSON `api_error` 与 `x-should-retry: true`，不发送部分 SSE |
+| 并行 tool_call 超过上限 | 仍 fail-closed，不重试、不串行化、不丢弃第三个工具 |
 | 流处理过程中抛出未捕获异常 | 发 `error` 事件（`"proxy stream error"`）后关闭流 |
-
-**待验证**：工具参数以 `input_json_delta` 一次性整体发出（未做增量分片），且外层用 `try { ... } catch {}` 静默吞掉序列化异常——该异常场景下客户端可能收不到任何 delta 且无错误提示，需要在 Gate 1 证据中确认是否需要改进。
